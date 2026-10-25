@@ -17,6 +17,46 @@ were checked. An audit of 406 preceding patch entries found no path overlaps wit
 Read-only `git apply --check` and a zero-fuzz application passed against reconstructed baselines.
 This checks source provenance and application, not C++ compilation, linking or runtime behavior.
 
+## Checked SQL prerequisite, not integrated
+
+`engine/patches/chromium-password-sync-checked-transactions.patch` adds opt-in
+`sql::Transaction::BeginImmediate`, `IsActive`, `CommitChecked` and `RollbackChecked`.
+It applies before the separate manager candidate. The manager candidate does not
+yet use these APIs; its ordinary mutation fallback remains unsafe as described below.
+
+Immediate mode refuses ambient wrapper or physical transactions, locks before any
+comparison read, and checks physical termination on commit, explicit rollback and
+destruction. Failed termination or a failed post-termination schema-read health
+probe non-destructively poisons the captured connection. Old guards cannot touch a
+closed/reopened connection incarnation. Confirmed commit and connection health are
+separate sticky results; an unhealthy connection does not erase a confirmed commit.
+Ordinary transaction callers keep their existing behavior unless immediate mode is used.
+
+This is not a statement barrier. Staging must check the active guard before each
+SQL step, stop after the first failure, and never reuse ordinary multi-statement
+mutators. It also needs checked bindings and statement cleanup: ordinary void bind
+methods cannot certify success, and a failed SQLite binding can be followed by a
+successful execution using NULL instead of the requested value. The strict statement
+prerequisite, lossless reads, narrow staging and shared-store coordinator remain unfinished.
+Raw rollback/rebegin on the same connection is not detected by an active guard;
+the coordinator must exclude that reentrancy rather than claim it is safe.
+
+The separate SQL patch has SHA-256
+`879ca744208df22d61f55807025a8c458c14b5341b6cb589f96d5ca671ab8065`.
+Eighteen new real SQL gtest definitions cover immediate contention, physical commit
+failure, automatic rollback, checked cleanup, incarnation changes and quarantine.
+They remain **uncompiled and unexecuted**. The four unusable-drive cases use a
+specialized VFS that still forwards physical close/unlock while injecting read/write
+faults; otherwise the fault fixture would itself leak file resources and locks.
+Independent source review found and repaired that fixture defect, with no remaining
+actionable findings in the bounded correction.
+
+Main verified exact pinned input hashes, strict patch application, zero-fuzz/no-offset
+replay, source equality and whitespace. A read-only audit found no overlapping SQL
+paths in 406 preceding patch entries or the manager patch. This is not a full-series
+build, C++ compilation, actual VFS behavior, native lifecycle verification or permission
+to enable incoming writes. All existing transaction-test bodies remain unchanged.
+
 ## Intended transaction contract
 
 `PasswordStoreInterface::CompareAndSetLogin` dispatches to the backend sequence. Unsupported
