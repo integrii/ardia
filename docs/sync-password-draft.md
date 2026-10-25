@@ -67,7 +67,9 @@ boundary and explicitly accepts reduced availability, not a new confidentiality 
 
 Recovery exports, clipboard lifetime, recovery authorization, standalone autofill changes and
 missing-folder retention are deliberately excluded. Their baseline behavior is unchanged.
-DeviceOwnerAuthorization and native API version 17 are shared with the independent recovery PR.
+DeviceOwnerAuthorization is shared with the independent recovery PR. This branch pairs native
+API version 17; the recovery branch now pairs version 18 for its request-scoped copy contract.
+Reconcile the version pair and overlapping module changes when either branch lands.
 The pod replaces the unused ArdiaImport dependency with ArdiaCore and LocalAuthentication.
 
 ## Verification and limits

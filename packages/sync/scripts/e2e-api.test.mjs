@@ -134,7 +134,8 @@ test("default hidden mode is explicitly non-password with visible coverage exclu
   assert.match(pkg.scripts.test, /node --test scripts\/e2e-api\.test\.mjs/);
 });
 
-test("integration runner removes only auto-owned scratch on success and compiler failure", () => {
+for (const [runner, executable] of [["password-integration.sh", "password-check"], ["password-authorization.sh", "password-authorization-check"]]) {
+test(`${runner} removes only auto-owned scratch on success and compiler failure`, () => {
   const directory = path.dirname(fileURLToPath(import.meta.url));
   const work = mkdtempSync(path.join(directory, ".scratch-ownership-test-"));
   try {
@@ -151,15 +152,16 @@ fs.writeFileSync(output, "#!/bin/sh\\nexit 0\\n", { mode: 0o700 });
 `, { mode: 0o700 });
     for (const fail of ["0", "1"]) {
       const env = { ...process.env, TMPDIR: temporary, PATH: `${bin}:${process.env.PATH}`, FIXTURE_COMPILER_FAIL: fail };
-      const automatic = spawnSync("/bin/bash", [path.join(directory, "password-integration.sh")], { env, encoding: "utf8", timeout: 10_000 });
+      const automatic = spawnSync("/bin/bash", [path.join(directory, runner)], { env, encoding: "utf8", timeout: 10_000 });
       assert.equal(automatic.status, fail === "1" ? 17 : 0, automatic.stderr);
       assert.deepEqual(readdirSync(temporary), []);
-      const explicit = spawnSync("/bin/bash", [path.join(directory, "password-integration.sh"), caller], { env, encoding: "utf8", timeout: 10_000 });
+      const explicit = spawnSync("/bin/bash", [path.join(directory, runner), caller], { env, encoding: "utf8", timeout: 10_000 });
       assert.equal(explicit.status, fail === "1" ? 17 : 0, explicit.stderr);
       assert.equal(readFileSync(path.join(caller, "keep"), "utf8"), "caller-owned");
-      assert.ok(readdirSync(caller).includes("password-check"));
+      assert.ok(readdirSync(caller).includes(executable));
     }
   } finally {
     rmSync(work, { recursive: true, force: true });
   }
 });
+}
