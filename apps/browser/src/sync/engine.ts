@@ -85,6 +85,7 @@ const DOC = "sync.json";
 const STATE = "sync-state.nns";
 const JOURNAL = "sync-journal.nns";
 const APP_SCOPE = "app";
+const MISSING_CHAIN_MESSAGE = "Sync data is missing from this folder. Your local sync data is kept, and Ardia will retry automatically.";
 const CYCLE_MS = 15_000;
 const AFTER_EDIT_MS = 3_000;
 
@@ -336,7 +337,7 @@ async function runCycle({ retiring = false } = {}) {
     const status = await native.chainStatus(doc.folder);
     if (status === "unavailable") return publishUi({ status: "offline", error: null });
     missingChain = status === "missing";
-    if (missingChain) return publishUi({ status: "stalled", error: "Sync data is missing from this folder. Your local sync data is kept, and Ardia will retry automatically." });
+    if (missingChain) return publishUi({ status: "stalled", error: MISSING_CHAIN_MESSAGE });
     const transport = folderTransport(native, doc.folder);
     const clock = new Clock(doc.deviceId, doc.clock);
     const device = doc.deviceId;
@@ -388,7 +389,7 @@ async function runCycle({ retiring = false } = {}) {
   } catch (error) {
     console.warn("[sync] cycle failed", error);
     missingChain = (await native.chainStatus(doc.folder).catch(() => null)) === "missing";
-    publishUi({ status: "stalled", error: errorText(error) });
+    publishUi({ status: "stalled", error: missingChain ? MISSING_CHAIN_MESSAGE : errorText(error) });
   } finally {
     clearTimeout(slow);
     running = false;

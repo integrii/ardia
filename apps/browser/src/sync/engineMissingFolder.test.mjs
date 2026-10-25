@@ -254,6 +254,8 @@ test("a chain disappearing after preflight retains the write journal through res
   assert.ok(journalAtWrite, "the pending batch reaches disk before the transport fails");
   assert.equal(first.useSync.getState().status, "stalled");
   assert.match(first.useSync.getState().error, /missing/i);
+  assert.match(first.useSync.getState().error, /local sync data is kept.*retry automatically/i);
+  const interruptedMessage = first.useSync.getState().error;
   assert.equal(shell.docs.get("sync-journal.nns"), journalAtWrite, "a missing transport cannot prune the durable journal");
   assert.equal(shell.docs.get("sync-state.nns"), disk.get("sync-state.nns"), "a missing transport cannot replace the last saved state");
   assert.equal(shell.docs.get("sync.json"), disk.get("sync.json"));
@@ -263,6 +265,7 @@ test("a chain disappearing after preflight retains the write journal through res
   assert.deepEqual(forgotten, []);
   const calls = folderCalls.length;
   await retry();
+  assert.equal(first.useSync.getState().error, interruptedMessage, "preflight and interrupted-cycle failures explain retention and retry consistently");
   assert.equal(folderCalls.length, calls);
   assert.equal(shell.docs.get("sync-journal.nns"), journalAtWrite);
   S().addBookmark({ profileId: "default", url: "https://queued-after-interruption.example/", title: "Queued after interruption" });
