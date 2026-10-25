@@ -331,7 +331,9 @@ by an unconditional write has been removed, not replaced with database CAS. See
   Native envelopes authenticate chain, scope and exact record identity. Randomized ciphertext
   is not a change detector: stable authenticated fingerprints are. Read creation dates survive
   the typed bridge; an unknown initial date must not make an old joining credential win as new.
-  Carrying the source date through future conditional insertion remains a blocked requirement.
+  The optional source date is authenticated inside the opaque credential and reaches the typed
+  native request. Real date-preserving insertion remains blocked; older clients can drop that
+  optional metadata when resealing a record.
 - **Apply recovery.** Candidate apply results and unapplied keys are persisted before native
   mutation. Earlier candidates survive changed retry targets and restarts. The checkpoint
   includes the observed clock; startup recovers its lower bound from persisted records and
@@ -341,7 +343,8 @@ by an unconditional write has been removed, not replaced with database CAS. See
   in Chromium's password backend, committed/conflict/error results and date-preserving new
   insertion are required before incoming password updates can resume. No presenter comparison
   or settling loop proves atomicity or disk durability. This is a safety mitigation, not
-  completed password synchronization.
+  completed password synchronization. The candidate store patch and its unexecuted Chromium
+  regressions are documented in [the storage verification note](sync-password-storage.md).
 - **Cadence.** Authorized passwords are read at most every 30 seconds, or with Sync Now.
   Denied or unavailable reads are not empty stores. Disabling password sync does not delete
   local passwords. A framework without the new native endpoints fails closed.

@@ -15,18 +15,29 @@ manager actions are unchanged. This removes unsafe sync writes; it does not impl
 finish password import/sync or make this PR merge-ready. The existing Boolean ABI cannot
 distinguish unavailable from a database conflict; callers must not treat refusal as success.
 
-Required follow-up: compare database-current values and insert, update or delete in one
-transaction on Chromium's backend sequence; report committed/conflict/error only after the
-transaction, retain notifications, and honor revocation and shutdown for queued work. Actual
-Chromium regressions must cover delayed notifications, local edits and deletion, expected
-absence, commit failure, revocation and shutdown. This snapshot intentionally does not attempt
-that backend fix.
+The candidate `chromium-password-sync-transaction.patch` adds a conditional store API and an
+outermost database transaction, plus twenty Chromium regression-test definitions. It cleanly
+applies to the pinned sources but has not been compiled or executed. The engine does not call
+it: the versioned seven-argument `ac_passwords_sync_compare_and_set_v2` also refuses all writes,
+with an explicit error status. Its distinct symbol avoids calling an older five-argument
+engine function with the wrong ABI. The old mutation stays binary-false; the old read keeps
+binary success/failure for compatibility. There is no fallback to cached presenter mutations.
 
-New-source insertion must also carry the source creation timestamp through the authenticated
-record, apply change, typed bridge and conditional database insertion. The disabled insertion
-path no longer creates a credential with the wrong current-time date, but date-preserving
-insertion is still a blocked requirement. Existing read timestamps, including epoch zero and
-unknown dates, are preserved; retaining read timestamps alone does not solve insertion.
+Still required: integrate the real store transaction with profile/request lifetime cancellation,
+settle identities spanning two stores, compile the patched Chromium framework and execute its
+database regressions, then build and exercise the complete native app. Queued work must not
+outlive a borrowed callback context. Definitions and clean patch application are not passing
+database tests or a finished backend integration.
+
+Source creation metadata is carried inside the authenticated opaque credential and through the
+typed native request. The candidate transaction preserves source dates on insertion and the
+database's existing date on updates. Neither production endpoint inserts anything, so real
+date-preserving insertion remains unverified and blocked. Unknown and Unix epoch zero remain
+distinct; recipient clock skew must not reject a representable source timestamp. A future
+enabled parser must explicitly reject known 1601-01-01, which collides with Chromium's null
+timestamp sentinel, rather than silently treating it as unknown. Older clients may drop the
+optional creation field when resealing a record; exact mixed-version date retention is not
+promised.
 
 ## Unsupported snapshots pause the whole password collection
 
@@ -68,7 +79,7 @@ boundary and explicitly accepts reduced availability, not a new confidentiality 
 Recovery exports, clipboard lifetime, recovery authorization, standalone autofill changes and
 missing-folder retention are deliberately excluded. Their baseline behavior is unchanged.
 DeviceOwnerAuthorization is shared with the independent recovery PR. This branch pairs native
-API version 17; the recovery branch now pairs version 18 for its request-scoped copy contract.
+API version 19; the recovery branch pairs version 18 for its request-scoped copy contract.
 Reconcile the version pair and overlapping module changes when either branch lands.
 The pod replaces the unused ArdiaImport dependency with ArdiaCore and LocalAuthentication.
 
@@ -108,7 +119,33 @@ confirms native collection validation precedes row callbacks. These checks passe
 not compile the Chromium-dependent read path, exercise a real store race, or replace the
 required pinned-Chromium database regressions. Scratch outputs are removed after each run.
 
-Fresh checks on this independent snapshot:
+Fresh main-session reruns of the transaction/lease continuation:
+
+| Check | Result |
+| --- | --- |
+| Browser and sync TypeScript | Both passed |
+| Focused browser engine, adapter, sharing and theme tests | 158 passed, one existing skip |
+| Sync package and mocked E2E API tests | 45 passed |
+| Production Core password boundary runner | 974 checks passed |
+| Production authorization/coordinator runner | 69 checks passed |
+| Production bridge/coordinator with hypothetical store | 546 assertions passed; 84 mixed Unicode payloads rejected and 84 migrated equivalents accepted |
+| Swift bridge, store typecheck and substituted native bridge | Passed; 19 native and 12 generic-denial completions |
+| Native policy/lease/registry/compatibility suite | 11 passed, including ASan/UBSan and TSan |
+| Two timing-containing browser fixture files, run serially with published-head controls | 15 candidate tests and 15 control tests passed; not the app performance gate |
+| Candidate storage patch | Clean application and source review only; 20 Chromium gtest definitions not compiled or executed |
+| Full Chromium/native app/XCTest | No passing result; full build environment unavailable |
+
+The wider non-timing browser run hit its 150-second deadline without a final summary and
+reported the same React Native Flow parse failure as the baseline; it is not passing evidence.
+Timing fixtures were checked separately from that run, serially and interleaved with controls.
+The published-head
+baseline reproduces a React Native Flow parse failure in `suggestStaleness.test.mjs`; the
+thirteen baseline bangs tests pass in isolation. A partial-archive bulk baseline run was
+invalid and timed out; it is not product-regression evidence. The complete baseline SwiftPM
+attempt also timed out while compiling SDK modules, before tests ran. No full-suite pass is
+claimed. See [the storage verification note](sync-password-storage.md) for remaining gates.
+
+Earlier checks before the current transaction/lease continuation (not current-source evidence):
 
 | Check | Result |
 | --- | --- |
