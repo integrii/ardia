@@ -11,8 +11,9 @@ swiftc "$core/SyncCrypto.swift" "$core/RecoveryPhrase.swift" "$core/Wordlist.swi
 "$scratch/password-sync-tests"
 swiftc -typecheck -I "$root/packages/sync/scripts/password-bridge-module" \
   "$root/packages/sync/ios/PasswordSync.swift" "$root/packages/sync/ios/ChromePasswordSyncStore.swift"
-xcrun clang++ -std=c++20 -fobjc-arc -fblocks -Wno-incomplete-implementation -Wno-objc-property-implementation \
+xcrun clang++ -std=c++20 -fobjc-arc -fblocks -fsanitize=address,undefined -Wno-incomplete-implementation -Wno-objc-property-implementation \
   -I "$root/engine/ardiacore/src/ardia/core/public" -I "$root/packages/ardiacore/ios" \
-  "$root/packages/ardiacore/ios/ArdiaCoreEngineBridge.mm" "$root/packages/sync/scripts/PasswordSyncNativeBridgeTests.mm" \
+  "$root/packages/ardiacore/ios/ArdiaCoreEngineBridge.mm" "$root/packages/ardiacore/ios/ArdiaCorePasswordSyncPrivate.mm" \
+  "$root/packages/sync/scripts/PasswordSyncNativeBridgeTests.mm" \
   -framework Foundation -framework AppKit -Wl,-export_dynamic -o "$scratch/native-bridge-tests"
 "$scratch/native-bridge-tests"

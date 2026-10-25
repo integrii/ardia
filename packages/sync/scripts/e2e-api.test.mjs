@@ -134,6 +134,16 @@ test("default hidden mode is explicitly non-password with visible coverage exclu
   assert.match(pkg.scripts.test, /node --test scripts\/e2e-api\.test\.mjs/);
 });
 
+test("standard sync task runs password authorization and policy checks before XCTest", () => {
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  const commands = pkg.scripts.test.split(" && ");
+  const authorization = commands.indexOf("bash scripts/password-authorization.sh");
+  const xctest = commands.findIndex((command) => command.startsWith("swift test "));
+  assert.ok(authorization >= 0 && authorization < xctest);
+  assert.match(commands[0], /scripts\/e2e-api\.test\.mjs/);
+  assert.match(commands[0], /scripts\/password-native-policy\.test\.mjs/);
+});
+
 for (const [runner, executable] of [["password-integration.sh", "password-check"], ["password-authorization.sh", "password-authorization-check"]]) {
 test(`${runner} removes only auto-owned scratch on success and compiler failure`, () => {
   const directory = path.dirname(fileURLToPath(import.meta.url));

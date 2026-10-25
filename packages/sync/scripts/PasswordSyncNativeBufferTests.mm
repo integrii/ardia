@@ -1,11 +1,8 @@
-#import <Foundation/Foundation.h>
-#include "chrome/browser/ardia/public/ac_engine.h"
+#import "ArdiaCorePasswordSyncPrivate.h"
 
 #include <cassert>
-#include <cmath>
-#include <memory>
 
-#include "password_sync_reply_buffer.inc"
+using namespace ardiacore_password_sync;
 
 int main() {
   @autoreleasepool {
@@ -47,6 +44,25 @@ int main() {
     allowed = NO;
     PasswordSyncDone(holder, 1);
     assert(completions == 2 && !revoked->rows);
-    puts("Production native reply buffer: failed and revoked snapshots discard all buffered rows; owned argument buffer cleared; completion once");
+
+    allowed = YES;
+    auto timed_out = std::make_shared<PasswordSyncCall>();
+    std::weak_ptr<PasswordSyncCall> lifetime = timed_out;
+    timed_out->authorized = ^BOOL { return allowed; };
+    timed_out->completion = ^(BOOL success, NSArray* rows) {
+      assert(!success && !rows);
+      ++completions;
+    };
+    holder = new PasswordSyncHolder(timed_out);
+    PasswordSyncLogin(holder, &row);
+    assert(timed_out->rows.count == 1);
+    timed_out->Finish(false);
+    timed_out.reset();
+    assert(completions == 3 && !lifetime.expired());
+    assert(!PasswordSyncAuthorized(holder));
+    PasswordSyncLogin(holder, &row);
+    PasswordSyncDone(holder, 1);
+    assert(completions == 3 && lifetime.expired());
+    puts("Production native reply buffer: failed and revoked snapshots discard all buffered rows; owned argument buffer cleared; completion once; timed-out holder survives late callbacks and releases on native completion");
   }
 }

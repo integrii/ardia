@@ -97,9 +97,13 @@ The native policy runner compiles the production snapshot-validation header and 
 mutation entrypoint extracted from `ac_passwords.cc`, with no substituted store/presenter
 implementation. Under AddressSanitizer and UndefinedBehaviorSanitizer it tests 22 identity
 collections and 10 mutation refusal/null-completion cases, including inaccessible input
-pointers that must never be dereferenced. It separately compiles the production reply-buffer
-and callback code extracted from `ArdiaCoreEngineBridge.mm` to verify failed and revoked
-snapshots discard buffered rows and clear owned argument buffers. A source-wiring check
+pointers that must never be dereferenced. It separately compiles the production private
+`ArdiaCorePasswordSyncPrivate.mm` helper and its buffer test as two translation units and links
+their objects, without copying source slices. Runtime checks verify failed and revoked
+snapshots discard buffered rows, owned argument buffers are cleared, and a timed-out callback
+holder survives late callbacks without completing twice, then releases at native completion.
+The adjacent bridge runner also links the real bridge and helper under the same sanitizers,
+with substituted host/engine endpoints. A source-wiring check
 confirms native collection validation precedes row callbacks. These checks passed; they do
 not compile the Chromium-dependent read path, exercise a real store race, or replace the
 required pinned-Chromium database regressions. Scratch outputs are removed after each run.

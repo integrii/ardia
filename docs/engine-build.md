@@ -291,6 +291,12 @@ framework.
     from Unix epoch zero; `created_ms` is milliseconds since Unix epoch when present. The bridge rejects invalid
     UTF-8 or non-finite dates and buffers rows until successful completion. Failure or revocation releases all
     buffered rows and returns unavailable (`nil`), never a partial or empty successful snapshot.
+    The buffer, callback holder and typed callbacks live in `ArdiaCorePasswordSyncPrivate.{h,mm}`;
+    the bridge includes that private helper and tests compile/link its implementation rather than copying a
+    source slice. CocoaPods' `*.{h,mm,swift}` source glob includes the implementation; the header is explicitly
+    private, its C++ symbols have hidden visibility, and it is absent from the public header list and generic
+    JavaScript dispatch. Regenerate the Pods project
+    when adding it; a standalone fixture compile is not a full pod or app build.
   - Completion uses zero for failure/unavailable and nonzero for a complete authorized read. This draft's
     compare-and-set always completes with zero before resolving a profile, parsing secrets, invoking authorization,
     or accessing any password service, including for equal-value/no-op requests. It does not report committed or

@@ -14,6 +14,7 @@ Pod::Spec.new do |s|
   s.frameworks     = 'WebKit'
   s.source_files   = '*.{h,mm,swift}'
   s.public_header_files = 'ArdiaCoreHost.h', 'ArdiaCoreWebView.h', 'ArdiaCoreTabStrip.h', 'ArdiaCoreEngineBridge.h', 'ArdiaCoreServices.h', 'ACSwipe.h', 'ACChromeWindow.h'
+  s.private_header_files = 'ArdiaCorePasswordSyncPrivate.h'
   s.resources      = 'page_script.js'
   s.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',

@@ -99,12 +99,15 @@ export const passwordSyncBridge = {
     await control?.beforeApply?.();
     if (!authorized()) return false;
     try {
-      for (const { key, desired, base } of changes) {
-        const want = openPasswordEnvelope(chain, scope, key, desired);
-        const known = openPasswordEnvelope(chain, scope, key, base);
-        const have = store.get(key.slice(3));
+      const decoded = changes.map(({ key, desired, base }) => ({
+        key,
+        want: openPasswordEnvelope(chain, scope, key, desired),
+        known: openPasswordEnvelope(chain, scope, key, base),
+        have: store.get(key.slice(3)),
+      }));
+      if (!decoded.every(({ have, want, known }) => have?.password === want?.password || have?.password === known?.password)) return false;
+      for (const { key, want, have } of decoded) {
         if (have?.password === want?.password) continue;
-        if (have?.password !== known?.password) return false;
         if (want) store.set(key.slice(3), { ...want });
         else store.delete(key.slice(3));
       }

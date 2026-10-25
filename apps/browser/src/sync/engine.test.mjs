@@ -17,6 +17,11 @@ let ids = 0;
 let chainStatus = "ok";
 let chainWait = null;
 let stateOpens = 0;
+let phraseResult = { ok: true };
+let phraseWait = null;
+const phraseCalls = [];
+let keyRevision = 0;
+const keyEvents = [];
 const keys = new Set();
 const forgotten = [];
 const folderCalls = [];
@@ -39,11 +44,22 @@ globalThis.acTestNativeModules = {
     createPhrase: async (id) => (keys.add(id), true),
     createChain: async () => {},
     unlock: async (id) => keys.has(id),
-    enterPhrase: async (id) => (keys.add(id), { ok: true }),
+    enterPhrase: async (id, text, path) => {
+      phraseCalls.push({ id, text, folder: path });
+      const result = phraseResult;
+      if (phraseWait) await phraseWait;
+      if ("ok" in result) {
+        keys.add(id);
+        keyRevision++;
+        keyEvents.push({ kind: "phrase", revision: keyRevision });
+      }
+      return result;
+    },
     forget: async (id) => { forgotten.push(id); keys.delete(id); },
     chainStatus: async () => { if (chainWait) await chainWait; return chainStatus; },
     write: async (_folder, scope, payload) => {
       folderCalls.push("write");
+      keyEvents.push({ kind: "write", revision: keyRevision });
       const id = `f${folder.size + 1}`;
       folder.set(id, { scope, payload });
       onWrite?.(JSON.parse(payload));
@@ -57,6 +73,7 @@ globalThis.acTestNativeModules = {
     },
     remove: async (_folder, _scope, list) => { folderCalls.push("remove"); list.forEach((id) => folder.delete(id)); },
     sealLocal: async (text) => {
+      keyEvents.push({ kind: "seal", revision: keyRevision });
       if (sealFailure) throw new Error("Local sealing failed");
       return `sealed:${text}`;
     },
@@ -192,6 +209,11 @@ const freshFolder = () => {
   chainStatus = "ok";
   chainWait = null;
   stateOpens = 0;
+  phraseResult = { ok: true };
+  phraseWait = null;
+  phraseCalls.length = 0;
+  keyRevision = 0;
+  keyEvents.length = 0;
   onWrite = null;
   passwordGrants.clear();
   passwordCalls.length = 0;
@@ -507,20 +529,37 @@ test("entering a phrase during a cycle preserves its unsaved batch and exact sco
   shell.heldSaves.on = true;
   S().addBookmark({ profileId: "default", url: "https://phrase.example/", title: "Phrase midcycle" });
   const syncing = engine.syncNow();
+  let recovering;
+  let result;
   try {
     await settle();
     assert.ok(shell.heldSaves.queue.length > 0, "the real cycle is suspended before publishing its batch");
-    assert.ok("ok" in await engine.enterRecoveryPhrase("/sync", "fixture phrase"));
+    keyEvents.length = 0;
+    recovering = engine.enterRecoveryPhrase("/other-folder", "fixture phrase").then((value) => { result = value; });
+    await settle();
+    assert.deepEqual(phraseCalls, [], "native key replacement must not start while the old cycle is held");
+    assert.equal(keyRevision, 0);
+    assert.equal(result, undefined);
     assert.equal(doc().scopes, scopes, "a live cycle must never lose its scope references");
     assert.equal(stateOpens, opens, "ready scopes are not reloaded from an older disk checkpoint");
   } finally {
     shell.heldSaves.on = false;
     for (const land of shell.heldSaves.queue.splice(0)) land();
     await syncing;
+    await recovering;
     await settle();
   }
   const batches = logs().filter((file) => file.ops.some((op) => op.v?.t === "Phrase midcycle"));
   assert.equal(batches.length, 1);
+  assert.ok("ok" in result);
+  assert.deepEqual(phraseCalls, [{ id: doc().deviceId, text: "fixture phrase", folder: "/sync" }]);
+  const keyChange = keyEvents.findIndex(({ kind }) => kind === "phrase");
+  assert.ok(keyChange > 0);
+  assert.ok(keyEvents.slice(0, keyChange).some(({ kind }) => kind === "write"), "the old cycle publishes before the native key changes");
+  assert.ok(keyEvents.slice(0, keyChange).some(({ kind }) => kind === "seal"), "the old cycle saves local state before the native key changes");
+  assert.ok(keyEvents.filter(({ kind }) => kind !== "phrase").every(({ revision }) => revision === 0), "no old-cycle write or seal uses the replaced key");
+  assert.equal(doc().scopes, scopes);
+  assert.equal(stateOpens, opens);
   assert.ok(Object.values(savedScopes()).some((state) => Object.values(state.records).some((record) => record.v?.t === "Phrase midcycle")));
 });
 
@@ -542,6 +581,8 @@ for (const timeout of [false, true]) {
       await settle();
       assert.equal(result, undefined, "the old cycle still owns the state");
       assert.equal(stateOpens, opens);
+      assert.deepEqual(phraseCalls, [], "a non-ready engine must also wait before mutating the native key");
+      assert.equal(keyRevision, 0);
       if (timeout) {
         const waiting = [...timers.values()].filter(({ delay }) => delay === 10_000);
         assert.equal(waiting.length, 1, "cycle recovery has a bounded deadline");
@@ -550,6 +591,8 @@ for (const timeout of [false, true]) {
         assert.deepEqual(result, { error: "unavailable" });
         assert.equal(engine.useSync.getState().status, "stalled");
         assert.equal(stateOpens, opens);
+        assert.deepEqual(phraseCalls, [], "a recovery timeout never invokes the native key mutation");
+        assert.equal(keyRevision, 0);
       }
     } finally {
       chainStatus = "unavailable";
@@ -566,6 +609,198 @@ for (const timeout of [false, true]) {
     assert.equal([...timers.values()].filter(({ delay }) => delay === 10_000).length, 0);
   });
 }
+
+test("phrase recovery pauses new cycles and duplicate recovery until native validation finishes", async () => {
+  const { engine, doc } = await persistenceFixture("phrase-native-pause");
+  let finish;
+  phraseWait = new Promise((resolve) => { finish = resolve; });
+  const recovering = engine.enterRecoveryPhrase("/ignored", "held fixture phrase");
+  let duplicate;
+  try {
+    await settle();
+    assert.deepEqual(phraseCalls, [{ id: doc().deviceId, text: "held fixture phrase", folder: "/sync" }]);
+    const calls = folderCalls.length;
+    S().addBookmark({ profileId: "default", url: "https://paused-recovery.example/", title: "Paused recovery" });
+    await engine.syncNow();
+    assert.equal(folderCalls.length, calls, "no new cycle can read or write while native recovery is pending");
+    duplicate = engine.enterRecoveryPhrase("/sync", "duplicate fixture phrase");
+    await settle();
+    assert.equal(phraseCalls.length, 1, "only one native recovery can own the pause");
+  } finally {
+    finish();
+    await recovering;
+    await duplicate;
+    phraseWait = null;
+  }
+  assert.deepEqual(await duplicate, { error: "unavailable" });
+  await engine.syncNow();
+  assert.ok(logs().some((file) => file.ops.some((op) => op.v?.t === "Paused recovery")), "cycles resume after recovery finishes");
+});
+
+test("invalid phrase results preserve ready scopes, exact native arguments and the old key, then release the recovery pause", async () => {
+  const { engine, doc } = await persistenceFixture("phrase-invalid-ready");
+  const scopes = doc().scopes;
+  scopes.app.pending = 23;
+  const opens = stateOpens;
+  const text = "  INVALID fixture phrase\nwith exact spacing  ";
+  phraseResult = { error: "unknownWord", word: "INVALID" };
+  assert.deepEqual(await engine.enterRecoveryPhrase("/not-the-configured-folder", text), phraseResult);
+  assert.deepEqual(phraseCalls, [{ id: doc().deviceId, text, folder: "/sync" }]);
+  assert.equal(keyRevision, 0);
+  assert.equal(stateOpens, opens);
+  assert.equal(doc().scopes, scopes);
+  assert.equal(scopes.app.pending, 23);
+  S().addBookmark({ profileId: "default", url: "https://invalid-phrase.example/", title: "After invalid phrase" });
+  await engine.syncNow();
+  assert.ok(logs().some((file) => file.ops.some((op) => op.v?.t === "After invalid phrase")), "a rejected phrase cannot leave sync paused");
+});
+
+test("invalid phrase while joining forwards its folder and never begins sync or installs a key", async () => {
+  freshFolder();
+  const engine = await import("./engine.ts?phrase-invalid-join");
+  const doc = inspect(engine);
+  const before = doc();
+  const disk = syncDisk();
+  phraseResult = { error: "mismatch" };
+  assert.deepEqual(await engine.enterRecoveryPhrase("/requested-join-folder", "invalid join fixture"), phraseResult);
+  assert.equal(phraseCalls.length, 1);
+  assert.equal(phraseCalls[0].text, "invalid join fixture");
+  assert.equal(phraseCalls[0].folder, "/requested-join-folder");
+  assert.match(phraseCalls[0].id, /^[a-z2-7]{26}$/);
+  assert.equal(keys.has(phraseCalls[0].id), false);
+  assert.equal(keyRevision, 0);
+  assert.equal(doc(), before);
+  assert.equal(engine.useSync.getState().enabled, false);
+  await settle();
+  assert.deepEqual(syncDisk(), disk);
+});
+
+test("phrase recovery drains an outstanding state save before invoking native key replacement", async () => {
+  const { engine, doc } = await persistenceFixture("phrase-held-state-writer");
+  doc().scopes.app.pending = 29;
+  shell.heldSaves.on = true;
+  const saving = engine.persistScopes();
+  await settle();
+  const recovering = engine.enterRecoveryPhrase("/sync", "fixture phrase");
+  try {
+    await settle();
+    assert.deepEqual(phraseCalls, [], "a save queued outside a cycle still belongs to the old key");
+    assert.equal(keyRevision, 0);
+  } finally {
+    shell.heldSaves.on = false;
+    for (const land of shell.heldSaves.queue.splice(0)) land();
+    await saving;
+    await recovering;
+  }
+  assert.equal(keyRevision, 1);
+  assert.equal(savedScopes().app.pending, 29);
+});
+
+for (const timeout of [false, true]) {
+  test(`phrase recovery ${timeout ? "times out without key mutation" : "waits"} while the completed cycle's final state writer is held`, async () => {
+    const { engine, doc } = await persistenceFixture(`phrase-final-state-writer-${timeout}`);
+    let held = false;
+    const unsubscribe = engine.useSync.subscribe((state) => {
+      if (held || state.status !== "updated") return;
+      held = true;
+      doc().scopes.app.pending = 31;
+      shell.heldSaves.on = true;
+    });
+    await engine.syncNow();
+    unsubscribe();
+    await settle();
+    assert.ok(held);
+    assert.equal(shell.heldSaves.queue.length, 1, "the cycle has returned but its final state save has not landed");
+    const recovering = engine.enterRecoveryPhrase("/sync", "fixture phrase");
+    try {
+      await settle();
+      assert.deepEqual(phraseCalls, [], "running=false is not proof that old-key local writes have drained");
+      assert.equal(keyRevision, 0);
+      if (timeout) {
+        const waiting = [...timers.values()].filter(({ delay }) => delay === 10_000);
+        assert.equal(waiting.length, 1);
+        waiting[0].run();
+        assert.deepEqual(await recovering, { error: "unavailable" });
+        assert.deepEqual(phraseCalls, []);
+        assert.equal(keyRevision, 0);
+      }
+    } finally {
+      shell.heldSaves.on = false;
+      for (const land of shell.heldSaves.queue.splice(0)) land();
+      await recovering;
+      await settle();
+    }
+    assert.equal(savedScopes().app.pending, 31);
+    assert.equal(keyRevision, timeout ? 0 : 1);
+    assert.equal([...timers.values()].filter(({ delay }) => delay === 10_000).length, 0);
+  });
+}
+
+test("configuration saves cannot submit old-state sealing while native phrase validation is pending", async () => {
+  const { engine, doc } = await persistenceFixture("phrase-native-writer-pause");
+  const before = syncDisk();
+  let finish;
+  phraseWait = new Promise((resolve) => { finish = resolve; });
+  const recovering = engine.enterRecoveryPhrase("/sync", "fixture phrase");
+  try {
+    await settle();
+    const seals = keyEvents.filter(({ kind }) => kind === "seal").length;
+    engine.setTypeSynced("tabs", false);
+    await settle();
+    assert.equal(keyEvents.filter(({ kind }) => kind === "seal").length, seals);
+    assert.deepEqual(syncDisk(), before, "normal state saves are deferred through native key validation");
+    await assert.rejects(engine.persistScopes(), /recover/i, "explicit checkpointing cannot submit work across a paused key transition");
+  } finally {
+    finish();
+    await recovering;
+    phraseWait = null;
+    await settle();
+  }
+  assert.deepEqual(await recovering, { error: "unavailable" }, "the post-native configuration generation is rechecked");
+  assert.equal(doc().types.tabs, false);
+  assert.equal(JSON.parse(shell.docs.get("sync.json")).types.tabs, false, "deferred saves resume without losing the configuration edit");
+});
+
+test("phrase recovery rejects configuration changes during its bounded drain even after an ABA toggle", async () => {
+  const { engine } = await persistenceFixture("phrase-configuration-epoch");
+  let finish;
+  chainWait = new Promise((resolve) => { finish = resolve; });
+  const syncing = engine.syncNow();
+  await settle();
+  const recovering = engine.enterRecoveryPhrase("/sync", "stale fixture phrase");
+  engine.setTypeSynced("tabs", false);
+  engine.setTypeSynced("tabs", true);
+  try {
+    await settle();
+    assert.deepEqual(phraseCalls, []);
+  } finally {
+    chainStatus = "unavailable";
+    finish();
+    await syncing;
+    chainWait = null;
+  }
+  assert.deepEqual(await recovering, { error: "unavailable" });
+  assert.deepEqual(phraseCalls, [], "a stale request must not touch the native key after the cycle drains");
+  assert.equal(keyRevision, 0);
+});
+
+test("phrase recovery rejects a replaced document after native validation instead of joining a stale configuration", async () => {
+  freshFolder();
+  const engine = await import("./engine.ts?phrase-document-replaced");
+  const doc = inspect(engine);
+  let finish;
+  phraseWait = new Promise((resolve) => { finish = resolve; });
+  const recovering = engine.enterRecoveryPhrase("/stale-join-folder", "fixture phrase");
+  await settle();
+  shell.docs.set("sync.json", JSON.stringify({ ...doc(), folder: "/current-folder" }));
+  start(engine);
+  const current = doc();
+  finish();
+  assert.deepEqual(await recovering, { error: "unavailable" });
+  phraseWait = null;
+  assert.equal(doc(), current);
+  assert.equal(engine.useSync.getState().enabled, false);
+});
 
 test("persistScopes holds an effect and sequence metadata until its exact snapshot lands", async () => {
   const { engine, doc } = await persistenceFixture("held");

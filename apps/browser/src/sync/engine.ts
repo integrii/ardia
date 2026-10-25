@@ -152,6 +152,8 @@ let timer: ReturnType<typeof setTimeout> | undefined;
 let forcePasswords = false;
 let stateReady = false;
 let stopping = false;
+let configurationEpoch = 0;
+let recovery: { changingKey: boolean; deferredSave: boolean } | null = null;
 let currentCycle: Promise<void> | null = null;
 let cycleClock: Clock | null = null;
 let passwordEpoch = 0;
@@ -271,11 +273,16 @@ function enqueueStateSave(): Promise<void> {
 }
 
 export async function persistScopes(): Promise<void> {
+  if (recovery?.changingKey) throw new Error("Sync is recovering. Try saving again after recovery finishes.");
   if (!SyncNative || !doc.enabled || !stateReady) throw new Error("The local sync state is not ready to save.");
   return enqueueStateSave();
 }
 
 function save() {
+  if (recovery?.changingKey) {
+    recovery.deferredSave = true;
+    return;
+  }
   if (doc.enabled && !stateReady) return;
   const target = doc;
   void enqueueStateSave().catch((error) => {
@@ -497,7 +504,7 @@ function extensionsOf(profileId: string): ExtensionsAdapter {
 }
 
 function scheduleSync(delay = AFTER_EDIT_MS) {
-  if (!doc.enabled || !stateReady || stopping) return;
+  if (!doc.enabled || !stateReady || stopping || recovery) return;
   clearTimeout(timer);
   timer = setTimeout(() => void runCycle(), delay);
 }
@@ -509,7 +516,7 @@ export async function syncNow() {
 
 async function runCycle({ retiring = false } = {}) {
   const native = SyncNative;
-  if (!native || !doc.enabled || !doc.folder || !doc.deviceId || !stateReady || (stopping && !retiring)) return;
+  if (!native || !doc.enabled || !doc.folder || !doc.deviceId || !stateReady || recovery || (stopping && !retiring)) return;
   if (running) {
     again = true;
     await currentCycle;
@@ -650,6 +657,7 @@ function themeAdopted(profileId: string) {
 export function adoptProfileTheme(profileId: string) {
   const link = doc.profiles[profileId];
   if (!link?.themeAdopting) return;
+  configurationEpoch++;
   delete link.themeAdopting;
   save();
   if (doc.enabled) scheduleSync(AFTER_EDIT_MS);
@@ -729,6 +737,7 @@ export async function folderInfo(path?: string | null): Promise<FolderInfo | nul
 
 function setSyncFolder(path: string) {
   if (doc.enabled) return;
+  configurationEpoch++;
   revokePasswords();
   doc.folder = path;
   save();
@@ -742,6 +751,7 @@ export async function chooseSyncFolder(): Promise<string | null> {
 }
 
 function begin(folder: string, deviceId: string, joining: boolean) {
+  configurationEpoch++;
   doc = { ...emptyDoc(), types: doc.types, enabled: true, folder, deviceId, setupAt: Date.now(), joining };
   revokePasswords();
   stateReady = true;
@@ -755,6 +765,8 @@ function begin(folder: string, deviceId: string, joining: boolean) {
 export async function turnOnSync(folder: string): Promise<{ ok: true } | { error: string }> {
   const native = SyncNative;
   if (!native) return { error: "Sync isn’t available in this build." };
+  if (recovery) return { error: "Sync is recovering. Try again after recovery finishes." };
+  configurationEpoch++;
   const deviceId = native.newDeviceId();
   try {
     if (!(await native.createPhrase(deviceId))) return { error: "Couldn’t save the sync key in your Keychain." };
@@ -769,49 +781,61 @@ export async function turnOnSync(folder: string): Promise<{ ok: true } | { error
 
 export async function enterRecoveryPhrase(folder: string, text: string): Promise<PhraseResult | { error: "unavailable" }> {
   const native = SyncNative;
-  if (!native) return { error: "unavailable" };
-  if (doc.enabled && doc.deviceId) {
-    const target = doc;
-    const result = await native.enterPhrase(doc.deviceId, text, doc.folder ?? folder);
-    if (doc !== target || stopping) return { error: "unavailable" };
-    if ("ok" in result && !stateReady) {
-      try {
-        if (currentCycle) {
-          let deadline: ReturnType<typeof setTimeout> | undefined;
-          try {
-            await Promise.race([
-              currentCycle,
-              new Promise<never>((_, reject) => { deadline = setTimeout(() => reject(new Error("Sync is still busy. Try your recovery phrase again.")), 10_000); }),
-            ]);
-          } finally {
-            clearTimeout(deadline);
-          }
-        }
-        if (doc !== target || stopping) return { error: "unavailable" };
-        if (stateReady) return result;
-        if (!await loadState()) return { error: "unavailable" };
-        if (doc !== target || stopping) return { error: "unavailable" };
+  if (!native || recovery || stopping) return { error: "unavailable" };
+  const target = doc;
+  const epoch = configurationEpoch;
+  const targetFolder = doc.folder;
+  const targetDevice = doc.deviceId;
+  const joining = !(doc.enabled && targetDevice);
+  const current = () => doc === target && configurationEpoch === epoch && !stopping && doc.folder === targetFolder && doc.deviceId === targetDevice;
+  const operation = { changingKey: false, deferredSave: false };
+  recovery = operation;
+  clearTimeout(timer);
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  try {
+    try {
+      await Promise.race([
+        (async () => {
+          if (currentCycle) await currentCycle;
+          operation.changingKey = true;
+          let writing: Promise<void>;
+          do {
+            writing = stateWriter;
+            await writing;
+          } while (writing !== stateWriter);
+        })(),
+        new Promise<never>((_, reject) => { deadline = setTimeout(() => reject(new Error("Sync is still busy. Try your recovery phrase again.")), 10_000); }),
+      ]);
+    } finally {
+      clearTimeout(deadline);
+    }
+    if (!current()) return { error: "unavailable" };
+    const deviceId = joining ? native.newDeviceId() : targetDevice!;
+    const result = await native.enterPhrase(deviceId, text, joining ? folder : targetFolder ?? folder);
+    if (!current()) return { error: "unavailable" };
+    if ("ok" in result) {
+      if (joining) begin(folder, deviceId, true);
+      else if (!stateReady) {
+        if (!await loadState() || !current()) return { error: "unavailable" };
         stateReady = true;
         publishUi({ status: "starting", error: null });
-        scheduleSync(0);
-      } catch (error) {
-        if (doc !== target || stopping) return { error: "unavailable" };
-        stateReady = false;
-        publishUi({ status: "stalled", error: errorText(error) });
-        return { error: "unavailable" };
       }
     }
     return result;
+  } catch (error) {
+    if (current()) publishUi({ status: "stalled", error: errorText(error) });
+    return { error: "unavailable" };
+  } finally {
+    recovery = null;
+    if (operation.deferredSave) save();
+    scheduleSync(0);
   }
-  const deviceId = native.newDeviceId();
-  const result = await native.enterPhrase(deviceId, text, folder);
-  if ("ok" in result) begin(folder, deviceId, true);
-  return result;
 }
 
 export async function stopSync({ deleteData = false } = {}) {
   const native = SyncNative;
   if (!native || !doc.enabled) return;
+  configurationEpoch++;
   stopping = true;
   revokePasswords();
   clearTimeout(timer);
@@ -840,6 +864,7 @@ export async function stopSync({ deleteData = false } = {}) {
 }
 
 export function setTypeSynced(type: DataType, enabled: boolean) {
+  configurationEpoch++;
   doc.types = { ...doc.types, [type]: enabled };
   if (type === "passwords") revokePasswords();
   reconcilePasswordBindings();
@@ -851,6 +876,7 @@ export function setTypeSynced(type: DataType, enabled: boolean) {
 export function setProfileSynced(profileId: string, enabled: boolean) {
   const link = doc.profiles[profileId];
   if (!link) return;
+  configurationEpoch++;
   doc.profiles[profileId] = enabled
     ? { syncId: link.syncId, enabled, ...(link.themeAdopting ? { themeAdopting: true as const } : {}) }
     : { ...link, enabled, retire: true };
@@ -896,6 +922,7 @@ export function addRemoteProfile(syncId: string): string | null {
   if (!remoteProfileRecord(syncId) || linkedProfileId(syncId)) return null;
   const { adds, sharesWith, waitingFor } = sharedDataChain(syncId);
   if (waitingFor) return null;
+  configurationEpoch++;
   let shareWith = sharesWith;
   for (const add of adds.reverse()) shareWith = addLinkedProfile(add, remoteProfileRecord(add)!, shareWith);
   save();
@@ -920,6 +947,7 @@ function addLinkedProfile(syncId: string, record: ProfileRecord, shareWith: stri
 
 export function startSync() {
   if (!SyncNative) return;
+  configurationEpoch++;
   cleanupSync?.();
   stateReady = false;
   load();
@@ -954,6 +982,7 @@ export function startSync() {
     if (s.bookmarks !== prev.bookmarks || s.settings !== prev.settings || s.profiles !== prev.profiles || s.groups !== prev.groups) scheduleSync();
   });
   cleanupSync = () => {
+    configurationEpoch++;
     disposed = true;
     stateReady = false;
     revokePasswords();

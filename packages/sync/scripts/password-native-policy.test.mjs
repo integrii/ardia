@@ -40,22 +40,27 @@ test("native read validates the whole collection before sending any rows", () =>
   assert.ok(read.indexOf("SyncSnapshotSupported") < read.indexOf("request->Send(row)"));
 });
 
-test("production native reply buffer discards failed and revoked snapshots", () => {
+test("linked production native reply buffer discards failed and revoked snapshots", () => {
   const scratch = mkdtempSync(join(process.env.ARDIA_NATIVE_POLICY_SCRATCH ?? tmpdir(), "ardia-password-buffer-"));
   try {
-    const bridge = readFileSync(join(root, "packages/ardiacore/ios/ArdiaCoreEngineBridge.mm"), "utf8");
-    const start = bridge.indexOf("void WipeSecret(");
-    const end = bridge.indexOf("void StartPasswordSync(", start);
-    assert.ok(start >= 0 && end > start);
-    writeFileSync(join(scratch, "password_sync_reply_buffer.inc"), bridge.slice(start, end));
+    const native = join(root, "packages/ardiacore/ios");
+    const sources = [join(directory, "PasswordSyncNativeBufferTests.mm"), join(native, "ArdiaCorePasswordSyncPrivate.mm")];
+    const objects = sources.map((_, index) => join(scratch, `native-buffer-${index}.o`));
+    for (const [index, file] of sources.entries()) {
+      const compiled = spawnSync(process.env.CXX ?? "clang++", [
+        "-std=c++20", "-fobjc-arc", "-fblocks", "-Wall", "-Wextra", "-Werror",
+        "-fsanitize=address,undefined", "-I", native, "-c", file, "-o", objects[index],
+      ], { encoding: "utf8", timeout: 120_000 });
+      assert.equal(compiled.status, 0, compiled.error?.message ?? compiled.stderr);
+    }
     const binary = join(scratch, "native-buffer-test");
-    const compiled = spawnSync(process.env.CXX ?? "clang++", [
-      "-std=c++20", "-fobjc-arc", "-fblocks", "-Wall", "-Wextra", "-Werror",
-      "-fsanitize=address,undefined", "-framework", "Foundation",
-      "-I", join(root, "engine/chromium/src"), "-I", scratch,
-      join(directory, "PasswordSyncNativeBufferTests.mm"), "-o", binary,
+    const linked = spawnSync(process.env.CXX ?? "clang++", [
+      "-fsanitize=address,undefined", "-framework", "Foundation", "-Wl,-export_dynamic", ...objects, "-o", binary,
     ], { encoding: "utf8", timeout: 120_000 });
-    assert.equal(compiled.status, 0, compiled.error?.message ?? compiled.stderr);
+    assert.equal(linked.status, 0, linked.error?.message ?? linked.stderr);
+    const symbols = spawnSync("nm", ["-gU", binary], { encoding: "utf8", timeout: 20_000 });
+    assert.equal(symbols.status, 0, symbols.error?.message ?? symbols.stderr);
+    assert.doesNotMatch(symbols.stdout, /ardiacore_password_sync/);
     const executed = spawnSync(binary, [], { encoding: "utf8", timeout: 20_000 });
     assert.equal(executed.status, 0, executed.error?.message ?? executed.stderr);
     assert.match(executed.stdout, /Production native reply buffer/);

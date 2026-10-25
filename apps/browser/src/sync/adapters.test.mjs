@@ -1129,6 +1129,32 @@ test("passwords: mock envelopes bind chain and scope but remain portable across 
   assert.equal(stub.passwordStores.get(a.id).get(row.key.slice(3)).password, "chain-secret");
 });
 
+for (const invalid of ["foreign desired", "foreign base", "malformed desired", "malformed base", "CAS conflict"]) {
+  test(`passwords: mock preflight rejects later ${invalid} without applying an earlier valid change`, async () => {
+    const a = new Device(`preflight-${invalid}`, new Folder());
+    const control = { chain: "chain-a" };
+    stub.passwordSyncControls.set(a.id, control);
+    for (const origin of ["https://first.example", "https://second.example"])
+      await a.with(() => stub.savePassword("", origin, "fixture", `desired-${origin}`));
+    const desired = await stub.passwordSyncBridge.readPasswordRecords("fixture", "p", "");
+    control.chain = "chain-b";
+    const foreign = await stub.passwordSyncBridge.readPasswordRecords("fixture", "p", "");
+    control.chain = "chain-a";
+    const store = stub.passwordStores.get(a.id);
+    for (const [key, login] of store) store.set(key, { ...login, password: `before-${login.url}` });
+    const base = await stub.passwordSyncBridge.readPasswordRecords("fixture", "p", "");
+    const before = structuredClone([...store]);
+    const changes = desired.map((row, i) => ({ key: row.key, desired: row.value, base: base[i].value }));
+    if (invalid === "CAS conflict") changes[1].base = null;
+    else {
+      const field = invalid.endsWith("desired") ? "desired" : "base";
+      changes[1][field] = invalid.startsWith("foreign") ? foreign[1].value : { version: 2, sealed: "missing-envelope", fingerprint: "invalid" };
+    }
+    assert.equal(await stub.passwordSyncBridge.applyPasswordRecords("fixture", "p", "", changes), false);
+    assert.deepEqual([...store], before);
+  });
+}
+
 test("passwords: legacy plaintext or malformed native records cannot be sent through the adapter", async () => {
   const key = "pw:https://bank.example\nalice";
   const plain = { o: "https://bank.example", u: "alice", p: "rejected-secret" };
