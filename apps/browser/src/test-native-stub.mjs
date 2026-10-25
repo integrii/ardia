@@ -1,13 +1,37 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+
+const documentScopes = new AsyncLocalStorage();
+export const createDocumentScope = () => {
+  const scope = { active: true, reply: bangListServer.reply };
+  return {
+    run: (work) => documentScopes.run(scope, work),
+    close: () => { scope.active = false; },
+  };
+};
+const documentsAvailable = () => documentScopes.getStore()?.active !== false;
 export const docs = new Map();
-export const readDocument = (name) => docs.get(name) ?? null;
-export const writeDocument = (name, contents) => docs.set(name, contents);
+export const readDocument = (name) => documentsAvailable() ? docs.get(name) ?? null : null;
+export const writeDocument = (name, contents) => documentsAvailable() ? docs.set(name, contents) : undefined;
 export const bangListServer = { reply: null };
-export const fetchBangList = (etag) => (bangListServer.reply ? bangListServer.reply(etag) : null);
-export const heldSaves = { on: false, queue: [] };
+export const fetchBangList = (etag) => {
+  if (!documentsAvailable()) return null;
+  const scope = documentScopes.getStore();
+  const reply = scope ? scope.reply : bangListServer.reply;
+  return reply ? reply(etag) : null;
+};
+export const heldSaves = { on: false, queue: [], onQueued: null };
 export const saveDocument = (name, contents) =>
   new Promise((resolve) => {
-    const land = () => (docs.set(name, contents), resolve());
-    if (heldSaves.on) heldSaves.queue.push(land);
+    const scope = documentScopes.getStore();
+    const land = () => {
+      if (scope?.active !== false) docs.set(name, contents);
+      resolve();
+    };
+    if (scope?.active === false) return resolve();
+    if (heldSaves.on) {
+      heldSaves.queue.push(land);
+      heldSaves.onQueued?.();
+    }
     else land();
   });
 export const setZoom = () => Promise.resolve();

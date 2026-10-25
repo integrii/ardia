@@ -3,6 +3,7 @@ import { beforeEach, test } from "node:test";
 import { bangDocument } from "../../../../../packages/core/src/bangs.ts";
 import * as bundledList from "../../../../../packages/core/src/bangList.ts";
 import { bangListServer, docs, heldSaves } from "../../test-native-stub.mjs";
+import { holdDocumentSaves } from "../../test-held-saves.mjs";
 
 globalThis.require = (id) => {
   assert.equal(id, "@ardia/core/src/bangList.ts");
@@ -168,16 +169,32 @@ test("a new list and its ETag are saved as one document, replace the table and c
   assert.equal(bangsFor("!").get("new7")?.name, "new 7");
 });
 
-test("a list that couldn't be saved is not used, and its ETag isn't kept", async () => {
+test("a list that couldn't be saved is not used, and its ETag isn't kept", { timeout: 5000 }, async (t) => {
+  const isolated = await import("./bangs.ts?held-save-fixture");
   server([{ status: 200, body: heliumBody("new"), etag: '"v2"' }]);
-  heldSaves.on = true;
-  const pending = refreshBangs();
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.equal(bangStatus().source, "bundled");
-  assert.equal(bangStatus().etag, null);
-  heldSaves.queue.shift()();
-  assert.equal((await pending).result, "updated");
-  assert.equal(bangStatus().etag, '"v2"');
+  const held = holdDocumentSaves(t, () => isolated.refreshBangs());
+  try {
+    await held.queued;
+    assert.equal(isolated.bangStatus().source, "bundled");
+    assert.equal(isolated.bangStatus().etag, null);
+    assert.equal(heldSaves.queue.length, 1);
+    heldSaves.queue.shift()();
+    assert.equal((await held.pending).result, "updated");
+    assert.equal(isolated.bangStatus().etag, '"v2"');
+  } finally {
+    held.close();
+  }
+});
+
+test("a refresh finishing without a save rejects the held-save wait and releases its fixture", { timeout: 5000 }, async (t) => {
+  const isolated = await import("./bangs.ts?held-save-no-save-fixture");
+  server([{ status: 500 }]);
+  const held = holdDocumentSaves(t, () => isolated.refreshBangs());
+  await assert.rejects(held.queued, /completed without enqueueing/);
+  assert.equal((await held.pending).result, "failed");
+  assert.equal(heldSaves.onQueued, null);
+  assert.equal(heldSaves.on, false);
+  assert.equal(heldSaves.queue.length, 0);
 });
 
 test("a failed, invalid or incomplete response keeps the last good list, and waits a day before asking again", async () => {

@@ -4,16 +4,37 @@ import { test } from "node:test";
 import { mount } from "../../test-hooks.mjs";
 
 globalThis.__DEV__ = false;
+const actionBoundaries = new Map([
+  ["../../lib/actions", ["moveTabToProfile"]],
+  ["../layout/splitActions", ["openSplitPane"]],
+  ["../settings/windows", ["openSettings"]],
+  ["../sidebar/actions", ["tabTitle"]],
+  ["@ardia/shell", ["prompt", "showMenu"]],
+]);
+const unusedActions = (names) => ({
+  url: `data:text/javascript,${encodeURIComponent(names.map((name) => `export const ${name} = () => { throw new Error("Unexpected action execution: ${name}"); };`).join("\n"))}`,
+  shortCircuit: true,
+});
+const extensionStore = new URL("../extensions/store.ts", import.meta.url).href;
 registerHooks({
   resolve(specifier, context, next) {
     if (context.parentURL?.endsWith("/omnibox/actions.ts") && specifier === "../../lib/commands")
-      return { url: `data:text/javascript,${encodeURIComponent("export const runCommand = () => {};")}`, shortCircuit: true };
+      return unusedActions(["runCommand"]);
+    if (context.parentURL?.endsWith("/omnibox/organizeActions.ts") && actionBoundaries.has(specifier))
+      return unusedActions(actionBoundaries.get(specifier));
+    if (context.parentURL?.endsWith("/omnibox/extensions.ts") && specifier === "../extensions/bridge")
+      return unusedActions(["openExtensionFromMenu"]);
+    if (context.parentURL?.endsWith("/omnibox/extensions.ts") && specifier === "../extensions/state")
+      return {
+        url: `data:text/javascript,${encodeURIComponent(`export { useWindowExtensions, shownIn } from ${JSON.stringify(extensionStore)}; export const openOptions = () => { throw new Error("Unexpected extension options execution"); };`)}`,
+        shortCircuit: true,
+      };
     return next(specifier, context);
   },
 });
 const { useBrowser } = await import("../../store/browser.ts");
 const { useSuggestions, scopeFor, keywordScope } = await import("./useSuggestions.ts");
-const { currentBarActions } = await import("./actions.ts");
+const { currentBarActions, runBarAction } = await import("./actions.ts");
 
 const S = () => useBrowser.getState();
 const DAY = 86_400_000;
@@ -94,6 +115,8 @@ test("the bar's actions and known hosts follow the store: bookmark, mute, pin, p
   assert.ok(titles().includes("Unpin from Top Apps"), "pinned");
   S().updateProfile(work, { name: "Office" });
   assert.ok(titles().includes("Switch to Office"), "a renamed profile");
+  assert.ok(titles().includes("Move Tab to Office"), "organize actions also read the renamed profile");
+  assert.ok(titles().includes("Split View Side by Side"), "the real organize action list remains available");
 
   assert.equal(scopeFor("newhost.example", w), null);
   const t = S().newTab(w, { url: "https://newhost.example/page", background: true });
@@ -109,4 +132,10 @@ test("Space enters a site's search only after its bare host or an engine keyword
   assert.equal(keywordScope("zebra.example", w)?.host, "zebra.example", "a host from history");
   for (const text of ["youtube", "github.com/foo", "github.com?x=1", "youtube.com:443", "me@github.com", "nothere.example"])
     assert.equal(keywordScope(text, w), null, text);
+});
+
+test("unused native action boundaries fail closed instead of silently executing a fake command", () => {
+  const { w } = setup();
+  assert.throws(() => runBarAction("newTab", w), /Unexpected action execution: runCommand/);
+  assert.throws(() => runBarAction("split:sideBySide", w), /Unexpected action execution: openSplitPane/);
 });

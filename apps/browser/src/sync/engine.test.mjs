@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { after, afterEach, test } from "node:test";
 
 const timers = new Map();
 let timerId = 0;
+const realSetTimeout = globalThis.setTimeout;
+const realClearTimeout = globalThis.clearTimeout;
 globalThis.setTimeout = (run, delay) => {
   const id = ++timerId;
-  timers.set(id, { run, delay });
+  timers.set(id, { run: () => { timers.delete(id); run(); }, delay });
   return id;
 };
 globalThis.clearTimeout = (id) => timers.delete(id);
@@ -124,6 +126,19 @@ const start = (engine) => {
   const cleanup = engine.startSync();
   if (cleanup) cleanups.push(cleanup);
 };
+afterEach(async () => {
+  shell.heldSaves.on = false;
+  for (const land of shell.heldSaves.queue.splice(0)) land();
+  for (const cleanup of cleanups.splice(0)) cleanup();
+  await settle();
+  assert.equal(passwordListeners.size, 0, "every engine fixture releases its native subscription");
+  assert.equal(shell.heldSaves.queue.length, 0, "no held document write crosses a test boundary");
+  timers.clear();
+});
+after(() => {
+  globalThis.setTimeout = realSetTimeout;
+  globalThis.clearTimeout = realClearTimeout;
+});
 
 test("a crash after a batch lands: after the restart it's sent again as it was, and the next batch gets a new seq", async () => {
   reset();

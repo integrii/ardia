@@ -76,6 +76,12 @@ boundary and explicitly accepts reduced availability, not a new confidentiality 
 - Denial and unavailable reads never mean an empty password store. Disabling password sync
   does not delete local passwords; other data continues syncing while passwords are paused.
 
+System-event invalidation is callback-linearized: lock, sleep and session notifications are
+delivered on the main queue, then revoke native permission through its gate. Notification
+delivery can be delayed while main is blocked, and a commit already admitted by the gate may
+finish. This does not establish an instantaneous physical lock/sleep boundary. Incoming writes
+remain disabled; actual native event delivery and database execution are still unverified.
+
 Recovery exports, clipboard lifetime, recovery authorization, standalone autofill changes and
 missing-folder retention are deliberately excluded. Their baseline behavior is unchanged.
 DeviceOwnerAuthorization is shared with the independent recovery PR. This branch pairs native
@@ -144,6 +150,23 @@ thirteen baseline bangs tests pass in isolation. A partial-archive bulk baseline
 invalid and timed out; it is not product-regression evidence. The complete baseline SwiftPM
 attempt also timed out while compiling SDK modules, before tests ran. No full-suite pass is
 claimed. See [the storage verification note](sync-password-storage.md) for remaining gates.
+
+A later diagnosis traced the wider run's long CPU-bound section to the 7,402 cases in
+`sync/pairs.test.mjs`, not a demonstrated engine timer leak. Test-only changes scope native
+action mocks to the suggestion test's unused action dependencies, synchronize held-save
+assertions with actual enqueueing, and release engine fixture subscriptions and writes after
+each test. Review found a cancellation-cleanup defect in the first held-save fixture; a real
+child-test timeout regression now verifies synchronous cleanup and quarantines resumed late
+writes. A fresh seven-file main-session rerun passes 180 tests with one existing skip, including
+the previously failing suggestion test and three cancellation/failure regressions. Independent
+review of the repair found no remaining defect. The subsequent 85-file non-timing main run
+completed in 367 seconds: 823 tests passed, one existing skip, no failures or cancellations.
+Browser source fingerprints stayed unchanged throughout. The two timing-containing fixture
+files were verified separately, serially interleaved with exact published-head controls: all
+15 candidate tests passed. The first import control hit its strict `<250 ms` assertion at
+250 ms; one bounded control/candidate recheck passed all seven import tests on both. Pinned
+ordering passed all eight on both. No source or threshold was changed. This is not the app
+performance gate or native build evidence.
 
 Earlier checks before the current transaction/lease continuation (not current-source evidence):
 
