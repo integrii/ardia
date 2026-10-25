@@ -1,10 +1,15 @@
 #include "chrome/browser/ardia/ac_passwords_sync_policy.h"
+#include "chrome/browser/ardia/ac_passwords_sync_adapter.h"
 #include "chrome/browser/ardia/public/ac_engine.h"
 
 #include <cassert>
 #include <cstdio>
 #include <type_traits>
 #include <vector>
+
+#include "password_sync_mutation_exports.inc"
+
+static_assert(ARDIA_PASSWORD_SYNC_CHROMIUM_VERIFIED == 0);
 
 static_assert(AC_PASSWORDS_SYNC_COMMITTED == 1);
 static_assert(AC_PASSWORDS_SYNC_CONFLICT == 0);
@@ -31,7 +36,46 @@ bool Supported(const std::vector<Credential>& credentials) {
       [](const auto& credential) { return credential.origins; });
 }
 
+struct Refusal {
+  int callbacks = 0;
+  int forbidden_callbacks = 0;
+  int status = 99;
+};
+
+int Forbidden(void* context) {
+  ++static_cast<Refusal*>(context)->forbidden_callbacks;
+  return 1;
+}
+
+void ForbiddenEnd(void* context, int) {
+  ++static_cast<Refusal*>(context)->forbidden_callbacks;
+}
+
+void Refused(void* context, int status) {
+  auto& refusal = *static_cast<Refusal*>(context);
+  ++refusal.callbacks;
+  refusal.status = status;
+}
+
+void ProductionMutationRefusal() {
+  for (const char* inaccessible : {static_cast<const char*>(nullptr), reinterpret_cast<const char*>(1)}) {
+    Refusal refusal;
+    ac_passwords_sync_compare_and_set_v2(inaccessible, inaccessible, Forbidden,
+                                        Forbidden, ForbiddenEnd, Refused, &refusal);
+    assert(refusal.callbacks == 1 && refusal.status == AC_PASSWORDS_SYNC_ERROR);
+    assert(refusal.forbidden_callbacks == 0);
+    ac_passwords_sync_compare_and_set_v2(inaccessible, inaccessible, Forbidden,
+                                        Forbidden, ForbiddenEnd, nullptr, &refusal);
+    assert(refusal.callbacks == 1 && refusal.forbidden_callbacks == 0);
+    ac_passwords_sync_compare_and_set(inaccessible, inaccessible, Forbidden,
+                                     Refused, &refusal);
+    assert(refusal.callbacks == 2 && refusal.status == 0);
+    assert(refusal.forbidden_callbacks == 0);
+  }
+}
+
 int main() {
+  ProductionMutationRefusal();
   const Credential first{u"fixture", {"https://first.example"}};
   const Credential second{u"fixture", {"https://second.example"}};
   const Credential grouped{u"fixture", {"https://first.example", "https://second.example"}};
@@ -58,5 +102,5 @@ int main() {
   assert(!Supported({first, {u"fixture", {"https://fixture.example#fragment"}}}));
   assert(!Supported({first, {u"fixture", {"https://\xc3\xa9.example"}}}));
 
-  puts("Production snapshot policy: 22 cases; typed conditional-mutation ABI: 10 compile-time checks; Chromium DB transaction requires its native store test target");
+  puts("Production snapshot policy: 22 cases; typed conditional-mutation ABI: 10 compile-time checks; exact v2/legacy exports refuse inaccessible input without authorization; Chromium DB transaction requires its native store test target");
 }

@@ -2,6 +2,8 @@
 
 assert(is_mac)
 
+import("//testing/test.gni")
+
 source_set("ardia") {
   sources = [
     "ac_autofill.cc",
@@ -35,6 +37,10 @@ source_set("ardia") {
     "ac_omnibox.h",
     "ac_passwords.cc",
     "ac_passwords.h",
+    "ac_passwords_sync_adapter.h",
+    "ac_passwords_sync_input.h",
+    "ac_passwords_sync_mutation.cc",
+    "ac_passwords_sync_mutation.h",
     "ac_passwords_sync_policy.h",
     "ac_process.cc",
     "ac_process.h",
@@ -74,6 +80,7 @@ source_set("ardia") {
     "//chrome/browser/download",
     "//chrome/browser/extensions",
     "//chrome/browser/extensions/api/passwords_private",
+    "//chrome/browser/password_manager/factories",
     "//chrome/browser/performance_manager/public/user_tuning",
     "//chrome/browser/picture_in_picture",
     "//chrome/browser/profiles:profile",
@@ -102,6 +109,7 @@ source_set("ardia") {
     "//components/keyed_service/core",
     "//components/os_crypt/common:switches",
     "//components/password_manager/core/browser",
+    "//components/password_manager/core/browser/password_store:password_store_interface",
     "//components/password_manager/core/common",
     "//components/performance_manager",
     "//components/prefs",
@@ -144,4 +152,29 @@ config("exports_config") {
 group("exports") {
   all_dependent_configs = [ ":exports_config" ]
   public_deps = [ ":ardia" ]
+}
+
+test("password_sync_adapter_unittests") {
+  sources = [
+    "ac_passwords_sync_adapter.h",
+    "ac_passwords_sync_adapter_unittest.cc",
+    "ac_passwords_sync_input.h",
+    "ac_passwords_sync_mutation.cc",
+    "ac_passwords_sync_mutation.h",
+    "ac_passwords_sync_policy.h",
+    "ac_sensitive_args.cc",
+    "ac_sensitive_args.h",
+    "public/ac_engine.h",
+  ]
+  deps = [
+    "//base",
+    "//base/test:run_all_unittests",
+    "//base/test:test_support",
+    "//components/os_crypt/async/browser:test_support",
+    "//components/password_manager/core/browser/password_store:password_store_impl",
+    "//components/password_manager/core/browser/password_store:password_store_interface",
+    "//testing/gtest",
+    "//third_party/boringssl",
+    "//url",
+  ]
 }

@@ -80,6 +80,18 @@ revocation/expiry, shutdown and callback-context survival until every queued bor
 
 ## Unfinished gates
 
+Source review has identified additional defects in this disabled candidate. Ordinary `AddLogin`
+may retry using replacement after a statement error automatically rolls back SQLite's
+transaction. That retry can write outside the intended transaction before native permission
+is checked. Broad `UpdateLogin` and auxiliary notes/issues readers also do not provide strict
+failure propagation or preservation of unrelated metadata. Existing transaction wrapper counts
+do not prove physical rollback completion. A synthetic SQLite probe demonstrates the automatic
+rollback/fallback mechanism only; it is not execution of this candidate. The passing source
+checks and unexecuted test definitions do not establish safety against these defects.
+
+A separate checked immediate-transaction SQL slice and narrow fail-fast mutation staging are
+required before coordinated profile/account-store integration. Neither is complete here.
+
 1. Wire the versioned engine endpoint to the real backend without a presenter fallback.
 2. Define a safe atomic contract for collisions spanning independent profile/account stores.
 3. Tie profile teardown and every timeout to cancellation without freeing borrowed contexts.

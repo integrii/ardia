@@ -14,15 +14,91 @@ test("production snapshot policy and typed conditional-mutation ABI", () => {
   const scratch = mkdtempSync(join(process.env.ARDIA_NATIVE_POLICY_SCRATCH ?? tmpdir(), "ardia-password-policy-"));
   try {
     const binary = join(scratch, "native-policy-test");
+    writeFileSync(join(scratch, "password_sync_mutation_exports.inc"), source.slice(
+      source.indexOf('extern "C" AC_ENGINE_EXPORT void ac_passwords_sync_compare_and_set(')));
     const compiled = spawnSync(process.env.CXX ?? "clang++", [
       "-std=c++20", "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
       "-I", join(root, "engine/chromium/src"),
+      "-I", scratch,
       join(directory, "PasswordSyncNativePolicyTests.cc"), "-o", binary,
     ], { encoding: "utf8", timeout: 120_000 });
     assert.equal(compiled.status, 0, compiled.error?.message ?? compiled.stderr);
     const executed = spawnSync(binary, [], { encoding: "utf8", timeout: 20_000 });
     assert.equal(executed.status, 0, executed.error?.message ?? executed.stderr);
     assert.match(executed.stdout, /Production snapshot policy: 22 cases/);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+for (const sanitizer of ["address,undefined", "thread"]) {
+  test(`production engine adapter helpers (${sanitizer}, fixture backend)`, () => {
+    const scratch = mkdtempSync(join(process.env.ARDIA_NATIVE_POLICY_SCRATCH ?? tmpdir(), "ardia-password-engine-adapter-"));
+    try {
+      const binary = join(scratch, "engine-adapter-test");
+      const compiled = spawnSync(process.env.CXX ?? "clang++", [
+        "-std=c++20", "-fobjc-arc", "-fblocks", "-Wall", "-Wextra", "-Werror", "-pthread",
+        `-fsanitize=${sanitizer}`, "-I", join(root, "engine/chromium/src"),
+        join(directory, "PasswordSyncEngineAdapterTests.mm"), "-framework", "Foundation", "-o", binary,
+      ], { encoding: "utf8", timeout: 120_000 });
+      assert.equal(compiled.status, 0, compiled.error?.message ?? compiled.stderr);
+      const executed = spawnSync(binary, [], { encoding: "utf8", timeout: 30_000 });
+      assert.equal(executed.status, 0, executed.error?.message ?? executed.stderr);
+      assert.match(executed.stdout, /Production adapter helpers:.*300 revoke races passed/);
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+}
+
+test("production adapter source uses pinned CAS, original deadline, and synchronous profile revocation", () => {
+  const handoff = source.slice(source.indexOf("[[maybe_unused]] void BeginSyncMutation("), source.indexOf("using ardia::Call;"));
+  assert.match(handoff, /const base::TimeTicks deadline = base::TimeTicks::Now\(\) \+ base::Seconds\(10\)/);
+  assert.match(handoff, /PasswordStoreAuthorizationLease>\(\s*deadline, SyncMutationCommitContext::Begin, SyncMutationCommitContext::End,\s*commit_context.get\(\)\)/);
+  assert.match(handoff, /make_shared<SyncMutationCommitContext>\(\s*begin_commit, end_commit, context\)/);
+  assert.match(handoff, /if \(!authorized\(context\) \|\| !state/);
+  assert.equal([...handoff.matchAll(/authorized\(context\)/g)].length, 1);
+  assert.match(handoff, /SyncStoreTopologySupported\(!!store, !!account\)/);
+  assert.match(handoff, /DispatchSyncMutation\(\s*\*store, std::move\(\*mutation\), std::move\(request\)/);
+  assert.doesNotMatch(handoff, /Presenter|GetSavedPasswords|GetCredentialFromId/);
+  assert.match(source, /void Release\(\) override \{\s*sync_mutations_\.Close\(\);\s*idle_\.Stop\(\);\s*weak_factory_\.InvalidateWeakPtrs\(\)/);
+  assert.match(source, /SyncMutationLoopShutdown<base::CurrentThread, MutationRequest>/);
+  assert.match(source, /base::NoDestructor<std::shared_ptr<Shutdown>> shutdown\(\s*Shutdown::Create\(\)\)/);
+  const parser = readFileSync(join(root, "engine/chromium/src/chrome/browser/ardia/ac_passwords_sync_mutation.cc"), "utf8");
+  assert.match(parser, /SensitiveArgs args\(json, kSyncMutationMaxJsonBytes\)/);
+  assert.ok(parser.indexOf("ParseSyncMutationInput") < parser.indexOf("FromMillisecondsSinceUnixEpoch"));
+  assert.match(parser, /if \(input->desired_created_ms\) \{\s*mutation\.date_created = base::Time::FromMillisecondsSinceUnixEpoch\(\s*\*input->desired_created_ms\);\s*if \(mutation\.date_created\.is_null\(\)\)/);
+  const input = readFileSync(join(root, "engine/chromium/src/chrome/browser/ardia/ac_passwords_sync_input.h"), "utf8");
+  assert.match(input, /std::optional<double> desired_created_ms/);
+  assert.doesNotMatch(input, /std::trunc|static_cast<int64_t>/);
+  const build = readFileSync(join(root, "engine/chromium/src/chrome/browser/ardia/BUILD.gn"), "utf8");
+  const standalone = build.slice(build.indexOf('test("password_sync_adapter_unittests")'));
+  for (const header of ["ac_passwords_sync_adapter.h", "ac_passwords_sync_input.h", "ac_passwords_sync_mutation.h",
+    "ac_passwords_sync_policy.h", "ac_sensitive_args.h", "public/ac_engine.h"]) {
+    assert.ok(standalone.includes(`"${header}"`), `standalone target must own ${header}`);
+  }
+  const beginRead = source.slice(source.indexOf("std::shared_ptr<SyncRequest> BeginSync("), source.indexOf("using SyncThen"));
+  assert.ok(beginRead.indexOf("SyncStoreTopologySupported") < beginRead.indexOf("request->session = Open(call)"));
+});
+
+test("production read submission refuses the whole account-store profile without omitting rows", () => {
+  const scratch = mkdtempSync(join(process.env.ARDIA_NATIVE_POLICY_SCRATCH ?? tmpdir(), "ardia-password-read-topology-"));
+  try {
+    const requestStart = source.indexOf("class SyncRequest {");
+    const requestEnd = source.indexOf("\n};", requestStart);
+    writeFileSync(join(scratch, "password_sync_read_request.inc"), source.slice(requestStart, requestEnd + 3));
+    writeFileSync(join(scratch, "password_sync_read_begin.inc"), source.slice(
+      source.indexOf("std::shared_ptr<SyncRequest> BeginSync("), source.indexOf("using SyncThen")));
+    const binary = join(scratch, "read-topology-test");
+    const compiled = spawnSync(process.env.CXX ?? "clang++", [
+      "-std=c++20", "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
+      "-I", join(root, "engine/chromium/src"), "-I", scratch,
+      join(directory, "PasswordSyncEngineReadTopologyTests.cc"), "-o", binary,
+    ], { encoding: "utf8", timeout: 120_000 });
+    assert.equal(compiled.status, 0, compiled.error?.message ?? compiled.stderr);
+    const executed = spawnSync(binary, [], { encoding: "utf8", timeout: 20_000 });
+    assert.equal(executed.status, 0, executed.error?.message ?? executed.stderr);
+    assert.match(executed.stdout, /Production read submission: all four profile\/account topologies/);
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }

@@ -14,17 +14,23 @@
 #include "base/functional/callback_helpers.h"
 #include "base/memory/scoped_refptr.h"
 #include "base/memory/weak_ptr.h"
+#include "base/no_destructor.h"
 #include "base/scoped_observation.h"
 #include "base/strings/string_util.h"
 #include "base/strings/utf_string_conversions.h"
 #include "base/task/sequenced_task_runner.h"
+#include "base/task/current_thread.h"
 #include "base/time/time.h"
 #include "base/timer/timer.h"
 #include "chrome/browser/extensions/api/passwords_private/passwords_private_delegate.h"
 #include "chrome/browser/extensions/api/passwords_private/passwords_private_delegate_factory.h"
 #include "chrome/browser/ardia/ac_passwords_sync_policy.h"
+#include "chrome/browser/ardia/ac_passwords_sync_adapter.h"
+#include "chrome/browser/ardia/ac_passwords_sync_mutation.h"
 #include "chrome/browser/ardia/ac_reauth.h"
 #include "chrome/browser/ardia/ac_sensitive_args.h"
+#include "chrome/browser/password_manager/factories/account_password_store_factory.h"
+#include "chrome/browser/password_manager/factories/profile_password_store_factory.h"
 #include "chrome/common/extensions/api/passwords_private.h"
 #include "chrome/grit/generated_resources.h"
 #include "components/password_manager/core/browser/export/export_progress_status.h"
@@ -42,6 +48,8 @@ namespace {
 using extensions::PasswordsPrivateDelegate;
 namespace pp = extensions::api::passwords_private;
 using Entries = PasswordsPrivateDelegate::UiEntries;
+using MutationRequest = SyncMutationRequest<
+    scoped_refptr<password_manager::PasswordStoreAuthorizationLease>>;
 
 constexpr int kSettleChecks = 20;
 constexpr size_t kMaxSecretArgsBytes = 64 * 1024;
@@ -102,6 +110,17 @@ class PasswordsState : public ProfileState {
     return weak_factory_.GetWeakPtr();
   }
 
+  bool TrackSyncMutation(const std::shared_ptr<MutationRequest>& request) {
+    using Shutdown = SyncMutationLoopShutdown<base::CurrentThread, MutationRequest>;
+    static base::NoDestructor<std::shared_ptr<Shutdown>> shutdown(
+        Shutdown::Create());
+    if (!*shutdown || !(*shutdown)->Track(request)) {
+      request->Cancel();
+      return false;
+    }
+    return sync_mutations_.Track(request);
+  }
+
   PasswordsPrivateDelegate* Use(base::ScopedClosureRunner* busy) {
     if (!delegate_) {
       delegate_ = extensions::PasswordsPrivateDelegateFactory::
@@ -134,6 +153,7 @@ class PasswordsState : public ProfileState {
 
  private:
   void Release() override {
+    sync_mutations_.Close();
     idle_.Stop();
     weak_factory_.InvalidateWeakPtrs();
     exporter_.reset();
@@ -180,6 +200,7 @@ class PasswordsState : public ProfileState {
   std::unique_ptr<password_manager::PasswordManagerExporter> exporter_;
   std::optional<Reply> export_reply_;
   base::ScopedClosureRunner export_busy_;
+  SyncMutationRegistry<MutationRequest> sync_mutations_;
   base::WeakPtrFactory<PasswordsState> weak_factory_{this};
 };
 
@@ -368,6 +389,14 @@ std::shared_ptr<SyncRequest> BeginSync(
     request->Finish(false);
     return nullptr;
   }
+  if (!SyncStoreTopologySupported(
+          !!ProfilePasswordStoreFactory::GetForProfile(
+              call.profile(), ServiceAccessType::EXPLICIT_ACCESS),
+          !!AccountPasswordStoreFactory::GetForProfile(
+              call.profile(), ServiceAccessType::EXPLICIT_ACCESS))) {
+    request->Finish(false);
+    return nullptr;
+  }
   request->session = Open(call);
   if (!request->Allowed()) {
     request->Finish(false);
@@ -431,6 +460,76 @@ std::set<std::string> SyncOrigins(const password_manager::CredentialUIEntry& cre
 bool Syncable(const password_manager::CredentialUIEntry& credential) {
   return !credential.blocked_by_user && credential.passkey_credential_id.empty() &&
          !credential.federation_origin.IsValid();
+}
+
+[[maybe_unused]] void BeginSyncMutation(
+    const char* profile_dir,
+    const char* args_json,
+    ac_passwords_sync_authorized_t authorized,
+    ac_passwords_sync_begin_commit_t begin_commit,
+    ac_passwords_sync_end_commit_t end_commit,
+    ac_passwords_sync_done_t done,
+    void* context) {
+  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+  const base::TimeTicks deadline = base::TimeTicks::Now() + base::Seconds(10);
+  if (!done) {
+    return;
+  }
+  if (!authorized || !begin_commit || !end_commit) {
+    return done(context, AC_PASSWORDS_SYNC_ERROR);
+  }
+  auto mutation = ParseSyncMutation(args_json);
+  if (!mutation) {
+    return done(context, AC_PASSWORDS_SYNC_ERROR);
+  }
+  Call call(profile_dir, nullptr, nullptr, nullptr);
+  if (!call || call.profile()->IsOffTheRecord() ||
+      call.profile()->ShutdownStarted()) {
+    return done(context, AC_PASSWORDS_SYNC_UNAUTHORIZED);
+  }
+  auto store = ProfilePasswordStoreFactory::GetForProfile(
+      call.profile(), ServiceAccessType::EXPLICIT_ACCESS);
+  auto account = AccountPasswordStoreFactory::GetForProfile(
+      call.profile(), ServiceAccessType::EXPLICIT_ACCESS);
+  if (!SyncStoreTopologySupported(!!store, !!account)) {
+    return done(context, AC_PASSWORDS_SYNC_ERROR);
+  }
+  auto state = StateFor<PasswordsState>(call.profile()).GetWeakPtr();
+  if (!authorized(context) || !state ||
+      state->profile()->ShutdownStarted() || base::TimeTicks::Now() >= deadline) {
+    return done(context, AC_PASSWORDS_SYNC_UNAUTHORIZED);
+  }
+  auto commit_context = std::make_shared<SyncMutationCommitContext>(
+      begin_commit, end_commit, context);
+  auto lease = base::MakeRefCounted<
+      password_manager::PasswordStoreAuthorizationLease>(
+      deadline, SyncMutationCommitContext::Begin, SyncMutationCommitContext::End,
+      commit_context.get());
+  auto request = std::make_shared<MutationRequest>(
+      lease, done, context, std::move(commit_context));
+  if (!state->TrackSyncMutation(request)) {
+    return request->Complete(AC_PASSWORDS_SYNC_UNAUTHORIZED);
+  }
+  if (!base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
+          FROM_HERE,
+          base::BindOnce([](std::weak_ptr<MutationRequest> request) {
+            if (auto live = request.lock()) {
+              live->Cancel();
+            }
+          }, std::weak_ptr<MutationRequest>(request)),
+          deadline - base::TimeTicks::Now())) {
+    return request->Complete(AC_PASSWORDS_SYNC_ERROR);
+  }
+  DispatchSyncMutation(
+      *store, std::move(*mutation), std::move(request),
+      [](auto completion) {
+        return base::BindOnce(
+            [](decltype(completion) completion,
+               password_manager::ConditionalLoginMutationStatus status) {
+              completion(status);
+            },
+            std::move(completion));
+      });
 }
 
 }
@@ -780,14 +879,19 @@ extern "C" AC_ENGINE_EXPORT void ac_passwords_sync_compare_and_set(
 }
 
 extern "C" AC_ENGINE_EXPORT void ac_passwords_sync_compare_and_set_v2(
-    const char*,
-    const char*,
-    ac_passwords_sync_authorized_t,
-    ac_passwords_sync_begin_commit_t,
-    ac_passwords_sync_end_commit_t,
+    [[maybe_unused]] const char* profile_dir,
+    [[maybe_unused]] const char* args_json,
+    [[maybe_unused]] ac_passwords_sync_authorized_t authorized,
+    [[maybe_unused]] ac_passwords_sync_begin_commit_t begin_commit,
+    [[maybe_unused]] ac_passwords_sync_end_commit_t end_commit,
     ac_passwords_sync_done_t done,
     void* context) {
+#if ARDIA_PASSWORD_SYNC_CHROMIUM_VERIFIED
+  ardia::BeginSyncMutation(profile_dir, args_json, authorized, begin_commit,
+                           end_commit, done, context);
+#else
   if (done) {
     done(context, AC_PASSWORDS_SYNC_ERROR);
   }
+#endif
 }
