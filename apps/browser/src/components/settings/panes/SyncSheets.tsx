@@ -1,6 +1,6 @@
 import { showMenu, Symbol } from "@ardia/shell";
 import { SyncNative, type FolderInfo } from "@ardia/sync";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Image, StyleSheet, Text, TextInput, View } from "react-native";
 import { useTheme } from "../../../lib/theme";
 import { enterRecoveryPhrase, stopSync } from "../../../sync/engine";
@@ -261,24 +261,57 @@ function StopSheet() {
 function DeleteDataSheet() {
   const [understood, setUnderstood] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [choice, setChoice] = useState<boolean | null>(null);
+  const [dismissible, setDismissible] = useState(false);
+  const accepted = useRef<{ deleteData: boolean; running: boolean; dismissible: boolean } | null>(null);
   const finish = async (deleteData: boolean) => {
+    if (accepted.current?.running) return;
+    const chosen = accepted.current?.deleteData ?? deleteData;
+    accepted.current = { deleteData: chosen, running: true, dismissible: false };
+    setChoice(chosen);
+    setDismissible(false);
     setBusy(true);
-    await stopSync({ deleteData });
-    closeSettingsSheet();
+    setError(null);
+    try {
+      const result = await stopSync({ deleteData: chosen });
+      if ("error" in result) {
+        setError(result.error);
+        accepted.current.dismissible = !result.pending;
+        setDismissible(!result.pending);
+      }
+      else closeSettingsSheet();
+    } catch {
+      setError("Sync couldn’t stop. Please try again.");
+    } finally {
+      accepted.current.running = false;
+      setBusy(false);
+    }
+  };
+  const dismiss = () => {
+    if (accepted.current?.running) return;
+    if (accepted.current?.dismissible) closeSettingsSheet();
+    else void finish(false);
   };
   return (
-    <Sheet width={420} onClose={() => void finish(false)}>
-      <Title>Delete Sync Data?</Title>
+    <Sheet width={420} onClose={dismiss}>
+      <Title>{choice === null ? "Delete Sync Data?" : "Stopping Sync"}</Title>
       <Body>
-        Would you also like to permanently delete your synced data from the sync folder? This will stop syncing on all your other devices too. To sync
-        again, you’ll need to set up each device from scratch. Your data on each Mac stays.
+        {choice === null
+          ? "Would you also like to permanently delete your synced data from the sync folder? This will stop syncing on all your other devices too. To sync again, you’ll need to set up each device from scratch. Your data on each Mac stays."
+          : choice ? "Stopping this device and deleting the shared sync data. Your data on this Mac stays."
+          : "Stopping this device and keeping the shared sync data. Your data on this Mac stays."}
       </Body>
-      <View style={{ marginTop: 12 }}>
+      {choice === null ? <View style={{ marginTop: 12 }}>
         <Checkbox value={understood} onChange={setUnderstood} label="I understand this cannot be undone" />
-      </View>
+      </View> : null}
+      {error ? <Body>{error}</Body> : null}
       <Buttons>
-        <Button title="Keep Sync Data" disabled={busy} onPress={() => void finish(false)} />
-        <Button title="Delete My Sync Data" kind="destructive" disabled={!understood || busy} onPress={() => void finish(true)} />
+        {dismissible ? <Button title="Close" disabled={busy} onPress={dismiss} /> : null}
+        {choice === null ? <>
+          <Button title="Keep Sync Data" disabled={busy} onPress={() => void finish(false)} />
+          <Button title="Delete My Sync Data" kind="destructive" disabled={!understood || busy} onPress={() => void finish(true)} />
+        </> : <Button title={busy ? "Stopping…" : "Retry Stop"} disabled={busy} onPress={() => void finish(choice)} />}
       </Buttons>
     </Sheet>
   );

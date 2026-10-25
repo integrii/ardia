@@ -21,6 +21,27 @@ let chainWait = null;
 let stateOpens = 0;
 let phraseResult = { ok: true };
 let phraseWait = null;
+let phraseFailure = false;
+let serialNative = false;
+let nativeQueue = Promise.resolve();
+const nativeEvents = [];
+let onForget = null;
+let createWait = null;
+let createChainWait = null;
+let deleteWait = null;
+let forgetWait = null;
+const deleted = [];
+const nativeCall = (kind, run) => {
+  const execute = async () => {
+    nativeEvents.push(`${kind}:start`);
+    try { return await run(); }
+    finally { nativeEvents.push(`${kind}:finish`); }
+  };
+  if (!serialNative) return execute();
+  const result = nativeQueue.then(execute);
+  nativeQueue = result.catch(() => {});
+  return result;
+};
 const phraseCalls = [];
 let keyRevision = 0;
 const keyEvents = [];
@@ -43,21 +64,23 @@ globalThis.acTestNativeModules = {
   ArdiaSync: {
     newDeviceId: () => (++ids).toString(2).padStart(26, "0").replaceAll("0", "a").replaceAll("1", "b"),
     deviceName: () => "Test Mac",
-    createPhrase: async (id) => (keys.add(id), true),
-    createChain: async () => {},
+    createPhrase: (id) => nativeCall("create", async () => { if (createWait) await createWait; keys.add(id); return true; }),
+    createChain: () => nativeCall("createChain", async () => { if (createChainWait) await createChainWait; }),
     unlock: async (id) => keys.has(id),
-    enterPhrase: async (id, text, path) => {
+    enterPhrase: (id, text, path) => nativeCall("phrase", async () => {
       phraseCalls.push({ id, text, folder: path });
       const result = phraseResult;
       if (phraseWait) await phraseWait;
+      if (phraseFailure) throw new Error("Native recovery failed");
       if ("ok" in result) {
         keys.add(id);
         keyRevision++;
         keyEvents.push({ kind: "phrase", revision: keyRevision });
       }
       return result;
-    },
-    forget: async (id) => { forgotten.push(id); keys.delete(id); },
+    }),
+    forget: (id) => nativeCall("forget", async () => { onForget?.(id); if (forgetWait) await forgetWait; forgotten.push(id); keys.delete(id); }),
+    deleteChain: async (path) => { deleted.push(path); if (deleteWait) await deleteWait; },
     chainStatus: async () => { if (chainWait) await chainWait; return chainStatus; },
     write: async (_folder, scope, payload) => {
       folderCalls.push("write");
@@ -226,6 +249,16 @@ const freshFolder = () => {
   stateOpens = 0;
   phraseResult = { ok: true };
   phraseWait = null;
+  phraseFailure = false;
+  serialNative = false;
+  nativeQueue = Promise.resolve();
+  nativeEvents.length = 0;
+  onForget = null;
+  createWait = null;
+  createChainWait = null;
+  deleteWait = null;
+  forgetWait = null;
+  deleted.length = 0;
   phraseCalls.length = 0;
   keyRevision = 0;
   keyEvents.length = 0;
@@ -816,6 +849,915 @@ test("phrase recovery rejects a replaced document after native validation instea
   assert.equal(doc(), current);
   assert.equal(engine.useSync.getState().enabled, false);
 });
+
+for (const outcome of ["success", "invalid", "rejection"]) {
+  test(`stop drains held ${outcome} recovery before publishing device and tab retirement, then forgets once`, { timeout: 20_000 }, async () => {
+    const { engine, doc } = await persistenceFixture(`stop-recovery-${outcome}`);
+    serialNative = true;
+    engine.setTypeSynced("passwords", true);
+    assert.equal(await engine.authorizePasswords(), true);
+    const target = doc();
+    const scopes = target.scopes;
+    const device = target.deviceId;
+    const scope = `p:${target.profiles.default.syncId}`;
+    const firstLog = logs().length;
+    const opens = stateOpens;
+    const queuedTimers = [...timers.values()];
+    let release;
+    phraseWait = new Promise((resolve) => { release = resolve; });
+    if (outcome === "invalid") phraseResult = { error: "mismatch" };
+    phraseFailure = outcome === "rejection";
+    const recovering = engine.enterRecoveryPhrase("/ignored", "held phrase");
+    await settle();
+    const calls = folderCalls.length;
+    const revocations = passwordRevocations;
+    const stopping = engine.stopSync();
+    assert.ok(passwordRevocations > revocations, "consent revocation is immediate, before recovery drains");
+    assert.equal(passwordGrants.size, 0);
+    assert.equal(engine.stopSync({ deleteData: true }), stopping, "first caller owns the options and cleanup");
+    onForget = (id) => {
+      assert.equal(id, device);
+      assert.equal(doc(), target);
+      assert.equal(doc().scopes, scopes, "ready recovery never reloads or drops the owned scopes");
+      const retirement = logs().slice(firstLog).flatMap((file) => file.ops);
+      assert.ok(retirement.some((op) => op.k === `dev:${device}` && op.v === null));
+      assert.ok(retirement.some((op) => op.k === `tabs:${device}` && op.v === null));
+      assert.equal(scopes.app.records[`dev:${device}`].v, null);
+      assert.equal(scopes[scope].records[`tabs:${device}`].v, null);
+    };
+    let result;
+    stopping.then((value) => { result = value; });
+    try {
+      engine.setTypeSynced("tabs", false);
+      engine.setProfileSynced("default", false);
+      engine.adoptProfileTheme("default");
+      assert.equal(engine.addRemoteProfile("not-present"), null);
+      assert.equal(engine.startSync(), undefined);
+      await engine.syncNow();
+      assert.equal(await engine.authorizePasswords(), false);
+      assert.ok("error" in await engine.turnOnSync("/replacement"));
+      assert.deepEqual(await engine.enterRecoveryPhrase("/replacement", "new phrase"), { error: "unavailable" });
+      for (const timer of queuedTimers) timer.run();
+      await settle();
+      assert.equal(result, undefined);
+      assert.equal(folderCalls.length, calls, "no retiring or normal folder IO while native recovery is held");
+      assert.deepEqual(forgotten, []);
+      assert.deepEqual(deleted, []);
+      assert.equal(target.types.tabs, true);
+      assert.equal(target.profiles.default.enabled, true);
+      assert.equal(nativeEvents.filter((event) => event === "forget:start").length, 0);
+    } finally {
+      release();
+      await recovering;
+      phraseWait = null;
+    }
+    assert.deepEqual(await stopping, { ok: true });
+    assert.equal(stateOpens, opens);
+    assert.deepEqual(forgotten, [device]);
+    assert.deepEqual(deleted, [], "a second caller cannot escalate keep-data into deletion");
+    assert.ok(nativeEvents.indexOf("phrase:finish") < nativeEvents.indexOf("forget:start"));
+    assert.equal(engine.useSync.getState().enabled, false);
+    assert.equal(JSON.parse(shell.docs.get("sync.json")).enabled, false);
+  });
+}
+
+test("a stop deadline reports incomplete without releasing the recovery ownership gate", { timeout: 20_000 }, async () => {
+  const { engine } = await persistenceFixture("stop-native-deadline");
+  serialNative = true;
+  let release;
+  phraseWait = new Promise((resolve) => { release = resolve; });
+  const recovering = engine.enterRecoveryPhrase("/sync", "held phrase");
+  await settle();
+  const calls = folderCalls.length;
+  const stopping = engine.stopSync({ deleteData: true });
+  const deadlines = [...timers.values()].filter(({ delay }) => delay === 10_000);
+  assert.equal(deadlines.length, 1);
+  deadlines[0].run();
+  try {
+    assert.match((await stopping).error, /hasn’t stopped yet/);
+    assert.equal(engine.stopSync(), stopping);
+    assert.deepEqual(await engine.enterRecoveryPhrase("/sync", "late phrase"), { error: "unavailable" });
+    assert.ok("error" in await engine.turnOnSync("/replacement"));
+    await engine.syncNow();
+    assert.equal(folderCalls.length, calls);
+    assert.deepEqual(forgotten, []);
+    assert.deepEqual(deleted, []);
+    assert.equal(engine.useSync.getState().enabled, true, "a report timeout is not native completion");
+  } finally {
+    release();
+    await recovering;
+    phraseWait = null;
+    await settle();
+  }
+  assert.equal(engine.useSync.getState().enabled, false);
+  assert.deepEqual(deleted, ["/sync"]);
+  assert.equal(forgotten.length, 1);
+});
+
+test("stop waits for a deferred recovery save and reports a held writer without forgetting", { timeout: 20_000 }, async () => {
+  const { engine, doc } = await persistenceFixture("stop-held-writer");
+  serialNative = true;
+  let release;
+  phraseWait = new Promise((resolve) => { release = resolve; });
+  const recovering = engine.enterRecoveryPhrase("/sync", "held phrase");
+  await settle();
+  engine.setTypeSynced("tabs", false);
+  shell.heldSaves.on = true;
+  const stopping = engine.stopSync();
+  release();
+  await recovering;
+  await settle();
+  assert.equal(shell.heldSaves.queue.length, 1, "the owned deferred save was enqueued before recovery completed");
+  const deadlines = [...timers.values()].filter(({ delay }) => delay === 10_000);
+  assert.equal(deadlines.length, 1);
+  deadlines[0].run();
+  try {
+    assert.ok("error" in await stopping);
+    assert.deepEqual(forgotten, []);
+    assert.equal(doc().enabled, true);
+    assert.deepEqual(await engine.enterRecoveryPhrase("/sync", "late phrase"), { error: "unavailable" });
+  } finally {
+    shell.heldSaves.on = false;
+    for (const land of shell.heldSaves.queue.splice(0)) land();
+    await settle();
+    phraseWait = null;
+  }
+  assert.equal(engine.useSync.getState().enabled, false);
+  assert.equal(forgotten.length, 1);
+});
+
+for (const valid of [true, false]) {
+  test(`stop after held ${valid ? "valid" : "invalid"} locked recovery ${valid ? "retires restored scopes" : "reports refusal without forgetting"}`, { timeout: 20_000 }, async () => {
+    const { engine, doc } = await persistenceFixture(`stop-locked-${valid}`);
+    serialNative = true;
+    const device = doc().deviceId;
+    keys.clear();
+    start(engine);
+    await settle();
+    assert.equal(engine.useSync.getState().status, "locked");
+    let release;
+    phraseWait = new Promise((resolve) => { release = resolve; });
+    phraseResult = valid ? { ok: true } : { error: "mismatch" };
+    const recovering = engine.enterRecoveryPhrase("/sync", "held phrase");
+    await settle();
+    const stopping = engine.stopSync();
+    release();
+    await recovering;
+    phraseWait = null;
+    const result = await stopping;
+    if (valid) {
+      assert.deepEqual(result, { ok: true });
+      assert.deepEqual(forgotten, [device]);
+      assert.ok(logs().some((file) => file.ops.some((op) => op.k === `dev:${device}` && op.v === null)));
+    } else {
+      assert.match(result.error, /couldn’t retire/);
+      assert.deepEqual(forgotten, []);
+      assert.equal(engine.useSync.getState().enabled, true);
+      assert.equal(doc().deviceId, device);
+    }
+  });
+}
+
+test("stop owns a joining recovery even before enabled becomes true", { timeout: 20_000 }, async () => {
+  freshFolder();
+  serialNative = true;
+  const engine = await import("./engine.ts?stop-joining");
+  const doc = inspect(engine);
+  const before = doc();
+  let release;
+  phraseWait = new Promise((resolve) => { release = resolve; });
+  const recovering = engine.enterRecoveryPhrase("/join-folder", "held phrase");
+  await settle();
+  const stopping = engine.stopSync();
+  assert.equal(doc().enabled, false);
+  assert.equal(engine.stopSync({ deleteData: true }), stopping);
+  release();
+  await recovering;
+  phraseWait = null;
+  assert.deepEqual(await stopping, { ok: true });
+  assert.notEqual(doc(), before, "the owned begin transition is accepted, not mistaken for external replacement");
+  assert.equal(doc().enabled, false);
+  assert.equal(doc().folder, "/join-folder");
+  assert.deepEqual(forgotten, [phraseCalls[0].id]);
+  assert.deepEqual(deleted, []);
+});
+
+test("stop cancels in-flight setup admission and waits for its serial native cleanup", { timeout: 20_000 }, async () => {
+  freshFolder();
+  serialNative = true;
+  const engine = await import("./engine.ts?stop-starting");
+  const doc = inspect(engine);
+  let release;
+  createWait = new Promise((resolve) => { release = resolve; });
+  const starting = engine.turnOnSync("/setup-folder");
+  await settle();
+  const stopping = engine.stopSync();
+  let result;
+  stopping.then((value) => { result = value; });
+  await settle();
+  assert.equal(result, undefined);
+  assert.deepEqual(forgotten, []);
+  release();
+  assert.ok("error" in await starting);
+  createWait = null;
+  assert.deepEqual(await stopping, { ok: true });
+  assert.equal(doc().enabled, false);
+  assert.equal(engine.useSync.getState().enabled, false);
+  assert.equal(forgotten.length, 1);
+  assert.ok(nativeEvents.indexOf("create:finish") < nativeEvents.indexOf("forget:start"));
+});
+
+test("a setup already creating its chain cannot call begin after stop intent", { timeout: 20_000 }, async () => {
+  freshFolder();
+  serialNative = true;
+  const engine = await import("./engine.ts?stop-creating-chain");
+  const doc = inspect(engine);
+  let release;
+  createChainWait = new Promise((resolve) => { release = resolve; });
+  const starting = engine.turnOnSync("/setup-folder");
+  await settle();
+  assert.equal(nativeEvents.at(-1), "createChain:start");
+  const stopping = engine.stopSync();
+  release();
+  assert.ok("error" in await starting);
+  createChainWait = null;
+  assert.deepEqual(await stopping, { ok: true });
+  assert.equal(doc().enabled, false);
+  assert.equal(forgotten.length, 1);
+  assert.ok(nativeEvents.indexOf("createChain:finish") < nativeEvents.indexOf("forget:start"));
+});
+
+test("a timed-out pre-native recovery drain cannot let stop bypass its held state writer", { timeout: 20_000 }, async () => {
+  const { engine, doc } = await persistenceFixture("stop-recovery-drain-timeout");
+  doc().scopes.app.pending = 53;
+  shell.heldSaves.on = true;
+  const saving = engine.persistScopes();
+  await settle();
+  const recovering = engine.enterRecoveryPhrase("/sync", "not-yet-native");
+  await settle();
+  const stopping = engine.stopSync();
+  const deadlines = [...timers.values()].filter(({ delay }) => delay === 10_000);
+  assert.equal(deadlines.length, 2);
+  deadlines[0].run();
+  assert.deepEqual(await recovering, { error: "unavailable" });
+  deadlines[1].run();
+  assert.ok("error" in await stopping);
+  try {
+    assert.deepEqual(phraseCalls, []);
+    assert.deepEqual(forgotten, []);
+    assert.equal(engine.stopSync(), stopping);
+    assert.equal(doc().enabled, true);
+  } finally {
+    shell.heldSaves.on = false;
+    for (const land of shell.heldSaves.queue.splice(0)) land();
+    await saving;
+    await settle();
+  }
+  assert.deepEqual(phraseCalls, []);
+  assert.equal(engine.useSync.getState().enabled, false);
+  assert.equal(forgotten.length, 1);
+});
+
+test("cleanup during the retiring cycle refuses before delete or forget", { timeout: 20_000 }, async () => {
+  const { engine, doc } = await persistenceFixture("stop-retiring-cleanup");
+  let release;
+  chainWait = new Promise((resolve) => { release = resolve; });
+  const stopping = engine.stopSync({ deleteData: true });
+  await settle();
+  const calls = folderCalls.length;
+  for (const cleanup of cleanups.splice(0)) cleanup();
+  doc().deviceId = "replacement-device";
+  doc().folder = "/replacement-folder";
+  release();
+  assert.ok("error" in await stopping);
+  chainWait = null;
+  assert.equal(folderCalls.length, calls);
+  assert.deepEqual(deleted, []);
+  assert.deepEqual(forgotten, []);
+  assert.equal(doc().deviceId, "replacement-device");
+});
+
+test("an unavailable retiring cycle reports failure and keeps the device key and document", { timeout: 20_000 }, async () => {
+  const { engine, doc } = await persistenceFixture("stop-offline");
+  const before = doc();
+  chainStatus = "unavailable";
+  assert.match((await engine.stopSync()).error, /couldn’t retire/);
+  assert.deepEqual(forgotten, []);
+  assert.equal(doc(), before);
+  assert.equal(doc().enabled, true);
+  chainStatus = "ok";
+  assert.deepEqual(await engine.stopSync(), { ok: true }, "a completed failed attempt releases only its own admission gate");
+  assert.equal(forgotten.length, 1);
+});
+
+test("cleanup during held recovery invalidates stop ownership without targeting replacement identity", { timeout: 20_000 }, async () => {
+  const { engine, doc } = await persistenceFixture("stop-cleanup");
+  serialNative = true;
+  let release;
+  phraseWait = new Promise((resolve) => { release = resolve; });
+  const recovering = engine.enterRecoveryPhrase("/sync", "held phrase");
+  await settle();
+  const stopping = engine.stopSync({ deleteData: true });
+  for (const cleanup of cleanups.splice(0)) cleanup();
+  doc().folder = "/replacement-folder";
+  doc().deviceId = "replacement-device";
+  release();
+  assert.deepEqual(await recovering, { error: "unavailable" });
+  phraseWait = null;
+  assert.match((await stopping).error, /Sync changed/);
+  assert.deepEqual(forgotten, []);
+  assert.deepEqual(deleted, []);
+  assert.equal(doc().deviceId, "replacement-device");
+});
+
+for (const stage of ["delete", "forget"]) {
+  test(`cleanup while ${stage} is pending prevents resetting a replacement document`, { timeout: 20_000 }, async () => {
+    const { engine, doc } = await persistenceFixture(`stop-${stage}-replacement`);
+    serialNative = true;
+    let release;
+    const wait = new Promise((resolve) => { release = resolve; });
+    if (stage === "delete") deleteWait = wait;
+    else forgetWait = wait;
+    const stopping = engine.stopSync({ deleteData: stage === "delete" });
+    await settle();
+    if (stage === "delete") assert.deepEqual(deleted, ["/sync"]);
+    else assert.equal(nativeEvents.at(-1), "forget:start");
+    for (const cleanup of cleanups.splice(0)) cleanup();
+    doc().folder = "/replacement-folder";
+    doc().deviceId = "replacement-device";
+    release();
+    assert.match((await stopping).error, /Sync changed/);
+    assert.equal(doc().folder, "/replacement-folder");
+    assert.equal(doc().deviceId, "replacement-device");
+    assert.ok(!forgotten.includes("replacement-device"));
+    if (stage === "delete") assert.deepEqual(forgotten, []);
+  });
+}
+
+test("a late password consent cannot restart IO or grant authority during stop intent", { timeout: 20_000 }, async () => {
+  const { engine } = await persistenceFixture("stop-late-consent");
+  engine.setTypeSynced("passwords", true);
+  let consentRelease;
+  consentWait = new Promise((resolve) => { consentRelease = resolve; });
+  const authorizing = engine.authorizePasswords();
+  await settle();
+  let release;
+  phraseWait = new Promise((resolve) => { release = resolve; });
+  const recovering = engine.enterRecoveryPhrase("/sync", "held phrase");
+  await settle();
+  const stopping = engine.stopSync();
+  const calls = folderCalls.length;
+  consentRelease();
+  assert.equal(await authorizing, false);
+  assert.equal(passwordGrants.size, 0);
+  assert.equal(folderCalls.length, calls);
+  release();
+  await recovering;
+  phraseWait = null;
+  consentWait = null;
+  assert.deepEqual(await stopping, { ok: true });
+});
+
+for (const file of ["sync-journal.nns", "sync-state.nns", "sync.json"]) {
+  test(`stop retries failed final ${file} until disabled metadata is durable without repeating native cleanup`, { timeout: 20_000 }, async () => {
+    const { engine, doc } = await persistenceFixture(`stop-finalization-${file}`);
+    const deleteData = file !== "sync.json";
+    const originalSet = shell.docs.set;
+    shell.docs.set = function (name, contents) {
+      if (forgotten.length && name === file) throw new Error(`Final ${file} failed`);
+      return originalSet.call(this, name, contents);
+    };
+    try {
+      assert.match((await engine.stopSync({ deleteData })).error, /failed/);
+      assert.equal(doc().enabled, false);
+      assert.equal(JSON.parse(shell.docs.get("sync.json")).enabled, true);
+      assert.equal(forgotten.length, 1);
+      assert.deepEqual(deleted, deleteData ? ["/sync"] : []);
+      const types = { ...doc().types };
+      const calls = folderCalls.length;
+      engine.setTypeSynced("tabs", false);
+      assert.deepEqual(doc().types, types);
+      assert.ok("error" in await engine.turnOnSync("/new-chain"));
+      assert.deepEqual(await engine.enterRecoveryPhrase("/sync", "new phrase"), { error: "unavailable" });
+      assert.equal(engine.startSync(), undefined);
+      await engine.syncNow();
+      assert.equal(folderCalls.length, calls, "retryable finalization retains the admission gate");
+      shell.docs.set = originalSet;
+      assert.deepEqual(await engine.stopSync({ deleteData: !deleteData }), { ok: true });
+      assert.equal(JSON.parse(shell.docs.get("sync.json")).enabled, false);
+      assert.equal(shell.docs.get("sync-state.nns"), "");
+      assert.equal(shell.docs.get("sync-journal.nns"), "");
+      assert.equal(forgotten.length, 1, "a successful forget is never repeated for a disk retry");
+      assert.deepEqual(deleted, deleteData ? ["/sync"] : [], "retry preserves the original accepted option");
+    } finally {
+      shell.docs.set = originalSet;
+    }
+  });
+}
+
+test("stop retries a rejected forget and then a failed state save without repeating completed deletion or forget", { timeout: 20_000 }, async () => {
+  const { engine } = await persistenceFixture("stop-forget-and-state-retry");
+  let rejectForget = true;
+  onForget = () => { if (rejectForget) throw new Error("Forget rejected"); };
+  assert.match((await engine.stopSync({ deleteData: true })).error, /Forget rejected/);
+  assert.deepEqual(deleted, ["/sync"]);
+  assert.deepEqual(forgotten, []);
+  rejectForget = false;
+  const originalSet = shell.docs.set;
+  shell.docs.set = function (name, contents) {
+    if (forgotten.length && name === "sync-state.nns") throw new Error("Final state failed");
+    return originalSet.call(this, name, contents);
+  };
+  try {
+    assert.match((await engine.stopSync()).error, /Final state failed/);
+    assert.equal(forgotten.length, 1);
+    assert.deepEqual(deleted, ["/sync"]);
+  } finally {
+    shell.docs.set = originalSet;
+  }
+  assert.deepEqual(await engine.stopSync(), { ok: true });
+  assert.equal(JSON.parse(shell.docs.get("sync.json")).enabled, false);
+  assert.deepEqual(deleted, ["/sync"]);
+  assert.equal(forgotten.length, 1);
+  assert.equal(nativeEvents.filter((event) => event === "forget:start").length, 2, "only the rejected forget is retried");
+});
+
+for (const offline of [false, true]) {
+  test(`stop drains existing startup and held state writer ${offline ? "without stranding readiness after an offline refusal" : "before retiring"}`, { timeout: 20_000 }, async () => {
+    const { engine, doc } = await persistenceFixture(`stop-startup-drain-${offline}`);
+    doc().scopes.app.pending++;
+    shell.heldSaves.on = true;
+    const saving = engine.persistScopes();
+    await settle();
+    assert.equal(shell.heldSaves.queue.length, 1);
+    const native = globalThis.acTestNativeModules.ArdiaSync;
+    const unlock = native.unlock;
+    let release;
+    native.unlock = () => new Promise((resolve) => { release = resolve; });
+    try {
+      start(engine);
+      const stopping = engine.stopSync();
+      release(true);
+      await settle();
+      assert.deepEqual(forgotten, []);
+      chainStatus = offline ? "unavailable" : "ok";
+      shell.heldSaves.on = false;
+      for (const land of shell.heldSaves.queue.splice(0)) land();
+      await saving.catch(() => {});
+      const result = await stopping;
+      if (offline) {
+        assert.ok("error" in result);
+        assert.equal(doc().enabled, true);
+        chainStatus = "ok";
+        const calls = folderCalls.length;
+        await engine.syncNow();
+        assert.ok(folderCalls.length > calls, "the owned startup completed and restored readiness despite stop intent");
+        assert.deepEqual(await engine.stopSync(), { ok: true });
+      } else assert.deepEqual(result, { ok: true });
+      assert.equal(doc().enabled, false);
+      assert.equal(JSON.parse(shell.docs.get("sync.json")).enabled, false);
+      assert.equal(forgotten.length, 1);
+    } finally {
+      native.unlock = unlock;
+      shell.heldSaves.on = false;
+      for (const land of shell.heldSaves.queue.splice(0)) land();
+      await saving.catch(() => {});
+    }
+  });
+}
+
+const stopSheetFixture = async (engine) => {
+  const { readFileSync } = await import("node:fs");
+  const { runInNewContext } = await import("node:vm");
+  const ts = (await import("typescript")).default;
+  const source = readFileSync(new URL("../components/settings/panes/SyncSheets.tsx", import.meta.url), "utf8");
+  const component = source.slice(source.indexOf("function DeleteDataSheet()"), source.indexOf("export function folderLabel"));
+  const compiled = ts.transpileModule(component, { compilerOptions: { target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.React, jsxFactory: "h", jsxFragmentFactory: "Fragment" } }).outputText;
+  const state = [true, false, null];
+  let index = 0;
+  let closed = 0;
+  const choices = [];
+  const scope = {
+    h: (type, props, ...children) => ({ type, props: props ?? {}, children: children.flat(Infinity) }),
+    useState: (initial) => {
+      const at = index++;
+      if (!(at in state)) state[at] = initial;
+      return [state[at], (value) => { state[at] = value; }];
+    },
+    useRef: (initial) => {
+      const at = index++;
+      if (!(at in state)) state[at] = { current: initial };
+      return state[at];
+    },
+    stopSync: (options) => { choices.push(options.deleteData); return engine.stopSync(options); },
+    closeSettingsSheet: () => { closed++; },
+    Fragment: "Fragment", Sheet: "Sheet", Title: "Title", Body: "Body", View: "View", Checkbox: "Checkbox", Buttons: "Buttons", Button: "Button",
+  };
+  runInNewContext(compiled, scope);
+  return {
+    render: () => { index = 0; return scope.DeleteDataSheet(); },
+    find: function find(node, title) {
+      return node && typeof node === "object" ? node.props.title === title ? node : node.children.map((child) => find(child, title)).find(Boolean) : undefined;
+    },
+    choices,
+    closed: () => closed,
+  };
+};
+
+for (const chainCreating of [false, true]) {
+  test(`stop retains rejected cleanup of an unadopted setup ${chainCreating ? "already creating a chain" : "creating a phrase"}`, { timeout: 20_000 }, async () => {
+    freshFolder();
+    serialNative = true;
+    const engine = await import(`./engine.ts?stop-rejected-setup-${chainCreating}`);
+    const doc = inspect(engine);
+    let release;
+    const wait = new Promise((resolve) => { release = resolve; });
+    if (chainCreating) createChainWait = wait;
+    else createWait = wait;
+    const attempts = [];
+    let refusing = true;
+    onForget = (id) => { attempts.push(id); if (refusing) throw new Error("Setup forget rejected"); };
+    const starting = engine.turnOnSync("/setup-folder").catch((error) => ({ error: error.message }));
+    await settle();
+    const stopping = engine.stopSync();
+    assert.equal(engine.stopSync({ deleteData: true }), stopping);
+    release();
+    assert.ok("error" in await starting);
+    const result = await stopping;
+    assert.match(result.error, /Setup forget rejected/);
+    assert.equal(result.pending, true);
+    assert.equal(keys.size, 1);
+    const generated = [...keys][0];
+    assert.ok(attempts.every((id) => id === generated));
+    assert.deepEqual(forgotten, []);
+    assert.ok("error" in await engine.turnOnSync("/another-folder"));
+    assert.deepEqual(await engine.enterRecoveryPhrase("/sync", "new phrase"), { error: "unavailable" });
+    assert.equal(engine.startSync(), undefined);
+    refusing = false;
+    assert.deepEqual(await engine.stopSync({ deleteData: true }), { ok: true });
+    assert.deepEqual(forgotten, [generated]);
+    assert.equal(keys.size, 0);
+    assert.deepEqual(deleted, [], "a retry cannot escalate the first stop's keep choice");
+    assert.equal(doc().enabled, false);
+    assert.deepEqual(await engine.stopSync(), { ok: true });
+    assert.deepEqual(forgotten, [generated]);
+  });
+}
+
+test("setup without stop retains its rejected cleanup and retries it before generating another identity", { timeout: 20_000 }, async () => {
+  freshFolder();
+  serialNative = true;
+  const engine = await import("./engine.ts?setup-rejected-cleanup-no-stop");
+  inspect(engine);
+  const native = globalThis.acTestNativeModules.ArdiaSync;
+  const createChain = native.createChain;
+  const chooseFolder = native.chooseFolder;
+  let refusing = true;
+  native.createChain = async () => { throw new Error("Chain failed"); };
+  onForget = () => { if (refusing) throw new Error("Cleanup failed"); };
+  try {
+    const first = await engine.turnOnSync("/bad-folder").catch((error) => ({ error: error.message }));
+    assert.ok("error" in first);
+    const generated = [...keys][0];
+    assert.ok(generated);
+    assert.equal(engine.startSync(), undefined, "a pending setup cleanup cannot be replaced by startup");
+    native.chooseFolder = async () => "/replacement-folder";
+    assert.equal(await engine.chooseSyncFolder(), null, "a pending setup cleanup retains its folder context");
+    assert.ok("error" in await engine.turnOnSync("/bad-folder"));
+    assert.equal(keys.size, 1);
+    refusing = false;
+    native.createChain = createChain;
+    assert.deepEqual(await engine.turnOnSync("/good-folder"), { ok: true });
+    assert.deepEqual(forgotten, [generated]);
+    assert.equal(keys.size, 1);
+    assert.ok(!keys.has(generated));
+    assert.deepEqual(await engine.stopSync(), { ok: true });
+    assert.equal(keys.size, 0);
+  } finally {
+    native.createChain = createChain;
+    native.chooseFolder = chooseFolder;
+  }
+});
+
+test("a declined phrase creation does not forget a device that was never created", { timeout: 20_000 }, async () => {
+  freshFolder();
+  const engine = await import("./engine.ts?setup-not-created");
+  inspect(engine);
+  const native = globalThis.acTestNativeModules.ArdiaSync;
+  const createPhrase = native.createPhrase;
+  let release;
+  native.createPhrase = () => new Promise((resolve) => { release = resolve; });
+  try {
+    const starting = engine.turnOnSync("/sync");
+    const stopping = engine.stopSync();
+    release(false);
+    assert.ok("error" in await starting);
+    assert.deepEqual(await stopping, { ok: true });
+    assert.deepEqual(forgotten, []);
+    assert.equal(nativeEvents.filter((event) => event === "forget:start").length, 0);
+  } finally {
+    native.createPhrase = createPhrase;
+  }
+});
+
+test("setup cleanup can retry a synchronous native bridge rejection and coalesces the retry", { timeout: 20_000 }, async () => {
+  freshFolder();
+  const engine = await import("./engine.ts?setup-cleanup-bridge-rejection");
+  inspect(engine);
+  const native = globalThis.acTestNativeModules.ArdiaSync;
+  const forget = native.forget;
+  let releaseCreate;
+  let releaseForget;
+  createWait = new Promise((resolve) => { releaseCreate = resolve; });
+  native.forget = () => { throw new Error("Bridge rejected cleanup"); };
+  try {
+    const starting = engine.turnOnSync("/sync");
+    const stopping = engine.stopSync();
+    releaseCreate();
+    assert.ok("error" in await starting);
+    assert.equal((await stopping).pending, true);
+    const generated = [...keys][0];
+    native.forget = forget;
+    forgetWait = new Promise((resolve) => { releaseForget = resolve; });
+    const retry = engine.stopSync();
+    assert.equal(engine.stopSync({ deleteData: true }), retry);
+    await settle();
+    assert.equal(nativeEvents.filter((event) => event === "forget:start").length, 1);
+    assert.deepEqual(forgotten, []);
+    releaseForget();
+    assert.deepEqual(await retry, { ok: true });
+    assert.deepEqual(forgotten, [generated]);
+    assert.deepEqual(deleted, []);
+  } finally {
+    releaseCreate();
+    releaseForget?.();
+    native.forget = forget;
+  }
+});
+
+test("a setup cleanup timeout retains exclusion and the generated identity across lifecycle cleanup", { timeout: 20_000 }, async () => {
+  freshFolder();
+  serialNative = true;
+  const engine = await import("./engine.ts?setup-cleanup-held-timeout");
+  const doc = inspect(engine);
+  let releaseCreate;
+  let releaseForget;
+  createWait = new Promise((resolve) => { releaseCreate = resolve; });
+  forgetWait = new Promise((resolve) => { releaseForget = resolve; });
+  const starting = engine.turnOnSync("/sync");
+  await settle();
+  const stopping = engine.stopSync();
+  releaseCreate();
+  await settle();
+  const generated = [...keys][0];
+  const deadlines = [...timers.values()].filter(({ delay }) => delay === 10_000);
+  assert.equal(deadlines.length, 1);
+  deadlines[0].run();
+  assert.equal((await stopping).pending, true);
+  for (const cleanup of cleanups.splice(0)) cleanup();
+  doc().deviceId = "foreign-device";
+  doc().folder = "/foreign-folder";
+  keys.add("foreign-device");
+  assert.equal(engine.stopSync(), stopping);
+  assert.deepEqual(forgotten, []);
+  assert.ok("error" in await engine.turnOnSync("/other"));
+  releaseForget();
+  await starting;
+  await settle();
+  assert.deepEqual(forgotten, [generated]);
+  assert.ok(keys.has("foreign-device"));
+  assert.equal(doc().deviceId, "foreign-device");
+  assert.deepEqual(deleted, []);
+});
+
+test("stale setup cleanup cannot borrow a replacement document device for forget", { timeout: 20_000 }, async () => {
+  freshFolder();
+  const engine = await import("./engine.ts?setup-stale-target-cleanup");
+  const doc = inspect(engine);
+  const target = doc();
+  const folder = target.folder;
+  let release;
+  createWait = new Promise((resolve) => { release = resolve; });
+  const starting = engine.turnOnSync("/setup-folder");
+  for (const cleanup of cleanups.splice(0)) cleanup();
+  target.deviceId = "replacement-device";
+  target.folder = "/replacement-folder";
+  keys.add("replacement-device");
+  release();
+  assert.ok("error" in await starting);
+  assert.deepEqual(forgotten, []);
+  assert.ok("error" in await engine.stopSync());
+  assert.deepEqual(forgotten, []);
+  assert.equal(doc().deviceId, "replacement-device");
+  target.deviceId = null;
+  target.folder = folder;
+  assert.deepEqual(await engine.stopSync(), { ok: true });
+  assert.equal(forgotten.length, 1);
+  assert.notEqual(forgotten[0], "replacement-device");
+  assert.ok(keys.has("replacement-device"));
+});
+
+test("the actual stop sheet can dismiss a definitive locked refusal to reach recovery", { timeout: 20_000 }, async () => {
+  const { engine } = await persistenceFixture("stop-sheet-definitive-refusal");
+  const native = globalThis.acTestNativeModules.ArdiaSync;
+  const unlock = native.unlock;
+  native.unlock = async () => false;
+  try {
+    start(engine);
+    await settle();
+    assert.equal(engine.useSync.getState().status, "locked");
+    const sheet = await stopSheetFixture(engine);
+    sheet.find(sheet.render(), "Keep Sync Data").props.onPress();
+    await settle();
+    const refusal = sheet.render();
+    assert.ok(sheet.find(refusal, "Close"));
+    const choices = sheet.choices.length;
+    refusal.props.onClose();
+    await settle();
+    assert.equal(sheet.closed(), 1);
+    assert.equal(sheet.choices.length, choices, "dismissal must not start another refused stop");
+    assert.deepEqual(forgotten, []);
+    assert.equal(engine.useSync.getState().enabled, true);
+    assert.ok("ok" in await engine.enterRecoveryPhrase("/sync", "recovered phrase"));
+    assert.deepEqual(await engine.stopSync(), { ok: true });
+  } finally {
+    native.unlock = unlock;
+  }
+});
+
+test("the actual stop sheet cannot dismiss or change a parked post-forget finalization", { timeout: 20_000 }, async () => {
+  const { engine } = await persistenceFixture("stop-sheet-parked-finalization");
+  const originalSet = shell.docs.set;
+  shell.docs.set = function (name, contents) {
+    if (forgotten.length && name === "sync.json") throw new Error("Final metadata failed");
+    return originalSet.call(this, name, contents);
+  };
+  try {
+    const sheet = await stopSheetFixture(engine);
+    sheet.find(sheet.render(), "Keep Sync Data").props.onPress();
+    await settle();
+    const parked = sheet.render();
+    assert.equal(sheet.find(parked, "Close"), undefined);
+    assert.equal(sheet.find(parked, "Delete My Sync Data"), undefined);
+    parked.props.onClose();
+    await settle();
+    assert.equal(sheet.closed(), 0);
+    assert.deepEqual(sheet.choices, [false, false]);
+    assert.ok("error" in await engine.turnOnSync("/new-folder"));
+    shell.docs.set = originalSet;
+    sheet.find(sheet.render(), "Retry Stop").props.onPress();
+    await settle();
+    assert.equal(sheet.closed(), 1);
+    assert.equal(JSON.parse(shell.docs.get("sync.json")).enabled, false);
+    assert.equal(forgotten.length, 1);
+    assert.deepEqual(deleted, []);
+  } finally {
+    shell.docs.set = originalSet;
+  }
+});
+
+test("startup configuration edits before stop do not discard the owned readiness restoration", { timeout: 20_000 }, async () => {
+  const { engine } = await persistenceFixture("stop-startup-config-edit");
+  const native = globalThis.acTestNativeModules.ArdiaSync;
+  const unlock = native.unlock;
+  let release;
+  native.unlock = () => new Promise((resolve) => { release = resolve; });
+  try {
+    start(engine);
+    engine.setTypeSynced("tabs", false);
+    const stopping = engine.stopSync();
+    release(true);
+    assert.deepEqual(await stopping, { ok: true });
+    assert.equal(JSON.parse(shell.docs.get("sync.json")).enabled, false);
+  } finally {
+    native.unlock = unlock;
+  }
+});
+
+test("owned cleanup releases a parked finalization gate without repeating completed native work", { timeout: 20_000 }, async () => {
+  const { engine } = await persistenceFixture("stop-finalization-cleanup");
+  const originalSet = shell.docs.set;
+  shell.docs.set = function (name, contents) {
+    if (forgotten.length && name === "sync.json") throw new Error("Final metadata failed");
+    return originalSet.call(this, name, contents);
+  };
+  try {
+    assert.ok("error" in await engine.stopSync());
+  } finally {
+    shell.docs.set = originalSet;
+  }
+  for (const cleanup of cleanups.splice(0)) cleanup();
+  const cleanup = engine.startSync();
+  assert.equal(typeof cleanup, "function");
+  cleanups.push(cleanup);
+  await settle();
+  assert.equal(engine.useSync.getState().status, "locked");
+  assert.equal(forgotten.length, 1);
+});
+
+test("recovery and stop can drain the same existing startup without a dependency cycle", { timeout: 20_000 }, async () => {
+  const { engine } = await persistenceFixture("stop-startup-recovery");
+  const native = globalThis.acTestNativeModules.ArdiaSync;
+  const unlock = native.unlock;
+  let release;
+  native.unlock = () => new Promise((resolve) => { release = resolve; });
+  try {
+    start(engine);
+    const recovering = engine.enterRecoveryPhrase("/sync", "held startup phrase");
+    const stopping = engine.stopSync();
+    await settle();
+    assert.deepEqual(phraseCalls, []);
+    assert.deepEqual(forgotten, []);
+    release(true);
+    assert.ok("ok" in await recovering);
+    assert.deepEqual(await stopping, { ok: true });
+    assert.equal(forgotten.length, 1);
+    assert.equal(JSON.parse(shell.docs.get("sync.json")).enabled, false);
+  } finally {
+    native.unlock = unlock;
+  }
+});
+
+test("a startup-load stop deadline does not cancel its owner or restore readiness after cleanup", { timeout: 20_000 }, async () => {
+  const { engine, doc } = await persistenceFixture("stop-startup-load-cleanup");
+  const native = globalThis.acTestNativeModules.ArdiaSync;
+  const openLocal = native.openLocal;
+  let release;
+  let held = true;
+  const wait = new Promise((resolve) => { release = resolve; });
+  native.openLocal = async (text) => {
+    if (held) { held = false; await wait; }
+    return openLocal(text);
+  };
+  try {
+    start(engine);
+    await settle();
+    assert.equal(held, false, "startup is awaiting a real state decryption result");
+    const stopping = engine.stopSync();
+    const deadlines = [...timers.values()].filter(({ delay }) => delay === 10_000);
+    assert.equal(deadlines.length, 1);
+    deadlines[0].run();
+    assert.ok("error" in await stopping);
+    assert.equal(engine.stopSync(), stopping);
+    assert.deepEqual(forgotten, []);
+    for (const cleanup of cleanups.splice(0)) cleanup();
+    const target = doc();
+    const scopes = target.scopes;
+    target.deviceId = "replacement-device";
+    target.folder = "/replacement-folder";
+    release();
+    await settle();
+    assert.equal(doc(), target);
+    assert.equal(doc().scopes, scopes, "the stale startup cannot install a decoded state snapshot");
+    assert.deepEqual(forgotten, []);
+    assert.deepEqual(deleted, []);
+    const calls = folderCalls.length;
+    await engine.syncNow();
+    assert.equal(folderCalls.length, calls, "cleanup cannot be undone by a late readiness callback");
+  } finally {
+    release();
+    native.openLocal = openLocal;
+  }
+});
+
+for (const deleteData of [false, true]) {
+  test(`the actual stop sheet retains its accepted ${deleteData ? "delete" : "keep"} choice after a report timeout`, { timeout: 20_000 }, async () => {
+    const { engine } = await persistenceFixture(`stop-sheet-choice-${deleteData}`);
+    let release;
+    phraseWait = new Promise((resolve) => { release = resolve; });
+    const recovering = engine.enterRecoveryPhrase("/sync", "held phrase");
+    await settle();
+    const sheet = await stopSheetFixture(engine);
+    const title = deleteData ? "Delete My Sync Data" : "Keep Sync Data";
+    sheet.find(sheet.render(), title).props.onPress();
+    await settle();
+    const deadlines = [...timers.values()].filter(({ delay }) => delay === 10_000);
+    assert.equal(deadlines.length, 1);
+    deadlines[0].run();
+    await settle();
+    try {
+      assert.equal(sheet.closed(), 0);
+      const after = sheet.render();
+      assert.equal(sheet.find(after, "Delete My Sync Data"), undefined, "a timeout cannot reopen the destructive choice");
+      assert.equal(sheet.find(after, "Keep Sync Data"), undefined);
+      assert.equal(sheet.find(after, "Retry Stop").props.disabled, false);
+      release();
+      await recovering;
+      phraseWait = null;
+      await settle();
+      assert.deepEqual(deleted, deleteData ? ["/sync"] : []);
+      sheet.find(sheet.render(), "Retry Stop").props.onPress();
+      await settle();
+      assert.equal(sheet.closed(), 1);
+      assert.deepEqual(sheet.choices, [deleteData, deleteData]);
+      assert.deepEqual(deleted, deleteData ? ["/sync"] : []);
+    } finally {
+      release();
+      await recovering;
+      phraseWait = null;
+    }
+  });
+}
 
 test("persistScopes holds an effect and sequence metadata until its exact snapshot lands", async () => {
   const { engine, doc } = await persistenceFixture("held");

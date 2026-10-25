@@ -153,7 +153,14 @@ let forcePasswords = false;
 let stateReady = false;
 let stopping = false;
 let configurationEpoch = 0;
-let recovery: { changingKey: boolean; deferredSave: boolean } | null = null;
+type RecoveryOperation = { changingKey: boolean; deferredSave: boolean; done: Promise<void>; joined?: { doc: SyncDoc; epoch: number } };
+type StopResult = { ok: true } | { error: string; pending: boolean };
+type StopOperation = { result: Promise<StopResult>; retry?: () => Promise<StopResult> };
+type SetupOperation = { done: Promise<void>; target: SyncDoc; targetFolder: string | null; targetDevice: string | null; deviceId: string; created: boolean; adopted: boolean; settled: boolean; cleanup?: Promise<void>; cleanupError?: string };
+let recovery: RecoveryOperation | null = null;
+let setup: SetupOperation | null = null;
+let startup: { done: Promise<void> } | null = null;
+let stopOperation: StopOperation | null = null;
 let currentCycle: Promise<void> | null = null;
 let cycleClock: Clock | null = null;
 let passwordEpoch = 0;
@@ -192,10 +199,12 @@ async function openSealed<T>(name: string, fallback: T): Promise<T> {
   return parsed as T;
 }
 
-async function loadState() {
+async function loadState(current = () => true) {
   const target = doc;
   const scopes = await openSealed<SyncDoc["scopes"]>(STATE, {});
+  if (!current()) return false;
   const loadedJournal = (await openSealed<{ journal?: Journal }>(JOURNAL, {})).journal ?? {};
+  if (!current()) return false;
   const clock = new Clock(target.deviceId ?? "", target.clock);
   for (const scope of new Set([...Object.keys(target.seqs ?? {}), ...Object.keys(loadedJournal)])) {
     const mine = (loadedJournal[scope] ?? []).filter((f) => f.device === target.deviceId);
@@ -207,7 +216,7 @@ async function loadState() {
     for (const file of state.journal ?? []) for (const op of file.ops) clock.observe(op.h);
   }
   for (const files of Object.values(loadedJournal)) for (const file of files) for (const op of file.ops) clock.observe(op.h);
-  if (doc !== target) return false;
+  if (doc !== target || !current()) return false;
   journal = loadedJournal;
   journalOnDisk = Object.keys(journal).length > 0;
   if (doc.deviceId) doc.clock = clock.last;
@@ -305,7 +314,7 @@ function publishUi(patch: Partial<SyncUi> = {}) {
 export const deviceName = () => SyncNative?.deviceName() ?? "This Mac";
 
 function passwordBindings(): PasswordBinding[] {
-  if (!doc.enabled || !doc.types.passwords || !doc.folder || stopping) return [];
+  if (!doc.enabled || !doc.types.passwords || !doc.folder || stopping || stopOperation) return [];
   const profiles = useBrowser.getState().profiles;
   return Object.entries(doc.profiles).flatMap(([profileId, link]) => {
     const profile = profiles[profileId];
@@ -421,7 +430,7 @@ async function refreshPasswordStatus() {
 
 export async function authorizePasswords(): Promise<boolean> {
   const native = SyncNative;
-  if (!native || !stateReady || stopping || useSync.getState().passwordsAuthorizing) return false;
+  if (!native || !stateReady || stopping || stopOperation || useSync.getState().passwordsAuthorizing) return false;
   reconcilePasswordBindings();
   const bindings = passwordBindings();
   if (!bindings.length) {
@@ -504,19 +513,20 @@ function extensionsOf(profileId: string): ExtensionsAdapter {
 }
 
 function scheduleSync(delay = AFTER_EDIT_MS) {
-  if (!doc.enabled || !stateReady || stopping || recovery) return;
+  if (!doc.enabled || !stateReady || stopping || stopOperation || recovery) return;
   clearTimeout(timer);
   timer = setTimeout(() => void runCycle(), delay);
 }
 
 export async function syncNow() {
+  if (stopOperation || stopping) return;
   forcePasswords = true;
   await runCycle();
 }
 
 async function runCycle({ retiring = false } = {}) {
   const native = SyncNative;
-  if (!native || !doc.enabled || !doc.folder || !doc.deviceId || !stateReady || recovery || (stopping && !retiring)) return;
+  if (!native || !doc.enabled || !doc.folder || !doc.deviceId || !stateReady || recovery || ((stopping || stopOperation) && !retiring)) return false;
   if (running) {
     again = true;
     await currentCycle;
@@ -525,15 +535,31 @@ async function runCycle({ retiring = false } = {}) {
   running = true;
   let finishCycle!: () => void;
   currentCycle = new Promise<void>((resolve) => { finishCycle = resolve; });
+  const target = doc;
+  const epoch = configurationEpoch;
+  const folder = doc.folder;
+  const deviceId = doc.deviceId;
+  const current = () => doc === target && (!retiring || (configurationEpoch === epoch && doc.folder === folder && doc.deviceId === deviceId));
+  const check = () => {
+    if (!current()) throw new Error("Sync changed during the current cycle.");
+  };
   passwordCycleFailed = false;
   clearTimeout(timer);
   const slow = setTimeout(() => useSync.getState().status === "updated" && publishUi({ status: "updating" }), 1000);
   try {
     reconcilePasswordBindings();
     await watchExtensions();
+    check();
     const status = await native.chainStatus(doc.folder);
-    if (status === "unavailable") return publishUi({ status: "offline", error: null });
-    if (status === "missing") return await resetFromElsewhere();
+    check();
+    if (status === "unavailable") {
+      publishUi({ status: "offline", error: null });
+      return false;
+    }
+    if (status === "missing") {
+      if (!retiring) await resetFromElsewhere();
+      return false;
+    }
     const transport = folderTransport(native, doc.folder);
     const clock = new Clock(doc.deviceId, doc.clock);
     cycleClock = clock;
@@ -549,6 +575,7 @@ async function runCycle({ retiring = false } = {}) {
       device,
       options: { persist: persistJournal(APP_SCOPE), persistState: persistScopes },
     });
+    check();
     if (app.joined) linkProfiles(app);
     reconcilePasswordBindings();
     confirmThemes(app);
@@ -560,17 +587,21 @@ async function runCycle({ retiring = false } = {}) {
       if (!retire && !link.enabled) continue;
       const scope = `p:${link.syncId}`;
       const state = (doc.scopes[scope] ??= emptyScope());
+      const adapters = await profileAdapters(profileId, retire);
+      check();
       await syncScope({
         scope,
         state,
         transport,
-        adapters: await profileAdapters(profileId, retire),
+        adapters,
         clock,
         device,
         options: { expired: historyExpired, persist: persistJournal(scope), persistState: persistScopes },
       });
+      check();
       pending += state.pending;
       if (!retire && doc.types.extensions && !s.profiles[profileId]?.dataId && extensionSyncAvailable()) await extensionsOf(profileId).reconcile(visible(state, "ext:"), Date.now());
+      check();
       if (retire) {
         delete link.retire;
         if (!exists) {
@@ -584,18 +615,21 @@ async function runCycle({ retiring = false } = {}) {
     if (app.joined) doc.joining = false;
     forcePasswords = false;
     const passwordsPaused = await refreshPasswordStatus();
+    check();
     publishUi({ status: passwordsPaused ? "passwordsPaused" : "updated", error: null, pending });
+    return true;
   } catch (error) {
     console.warn("[sync] cycle failed", error);
-    publishUi({ status: "stalled", error: errorText(error) });
+    if (current()) publishUi({ status: "stalled", error: errorText(error) });
+    return false;
   } finally {
     clearTimeout(slow);
-    if (cycleClock) doc.clock = cycleClock.last;
+    if (cycleClock && current()) doc.clock = cycleClock.last;
     cycleClock = null;
     running = false;
     currentCycle = null;
     finishCycle();
-    save();
+    if (current()) save();
     if (doc.enabled) {
       if (again) {
         again = false;
@@ -655,6 +689,7 @@ function themeAdopted(profileId: string) {
 }
 
 export function adoptProfileTheme(profileId: string) {
+  if (stopOperation) return;
   const link = doc.profiles[profileId];
   if (!link?.themeAdopting) return;
   configurationEpoch++;
@@ -685,8 +720,13 @@ function linkProfiles(app: ScopeState) {
 }
 
 async function resetFromElsewhere() {
-  await SyncNative?.forget(doc.deviceId!);
-  doc = { ...emptyDoc(), folder: doc.folder, types: doc.types };
+  const target = doc;
+  const epoch = configurationEpoch;
+  const deviceId = target.deviceId;
+  const folder = target.folder;
+  await SyncNative?.forget(deviceId!);
+  if (doc !== target || configurationEpoch !== epoch || doc.deviceId !== deviceId || doc.folder !== folder) return;
+  doc = { ...emptyDoc(), folder, types: target.types };
   clearJournal();
   save();
   publishUi({ status: "reset", error: "This device is out of sync. Sync may have been reset from another device." });
@@ -736,7 +776,7 @@ export async function folderInfo(path?: string | null): Promise<FolderInfo | nul
 }
 
 function setSyncFolder(path: string) {
-  if (doc.enabled) return;
+  if (doc.enabled || stopOperation || setup) return;
   configurationEpoch++;
   revokePasswords();
   doc.folder = path;
@@ -745,7 +785,10 @@ function setSyncFolder(path: string) {
 }
 
 export async function chooseSyncFolder(): Promise<string | null> {
+  if (stopOperation || setup) return null;
+  const epoch = configurationEpoch;
   const picked = (await SyncNative?.chooseFolder(doc.folder)) ?? null;
+  if (stopOperation || setup || epoch !== configurationEpoch) return null;
   if (picked) setSyncFolder(picked);
   return picked;
 }
@@ -753,6 +796,7 @@ export async function chooseSyncFolder(): Promise<string | null> {
 function begin(folder: string, deviceId: string, joining: boolean) {
   configurationEpoch++;
   doc = { ...emptyDoc(), types: doc.types, enabled: true, folder, deviceId, setupAt: Date.now(), joining };
+  const transition = { doc, epoch: configurationEpoch };
   revokePasswords();
   stateReady = true;
   stopping = false;
@@ -760,35 +804,86 @@ function begin(folder: string, deviceId: string, joining: boolean) {
   save();
   publishUi({ status: "starting", error: null });
   scheduleSync(0);
+  return transition;
+}
+
+async function clearUnadoptedSetup(operation: SetupOperation) {
+  if (!operation.created || operation.adopted) return;
+  if (operation.cleanup) return operation.cleanup;
+  if (setup !== operation || doc !== operation.target || doc.folder !== operation.targetFolder || doc.deviceId !== operation.targetDevice || doc.deviceId === operation.deviceId) {
+    operation.cleanupError = "Sync changed before setup cleanup finished.";
+    throw new Error(operation.cleanupError);
+  }
+  operation.cleanup = Promise.resolve().then(async () => {
+    try {
+      await SyncNative!.forget(operation.deviceId);
+      operation.created = false;
+      operation.cleanupError = undefined;
+      if (setup === operation && operation.settled) setup = null;
+    } catch (error) {
+      operation.cleanupError = errorText(error);
+      throw error;
+    } finally {
+      operation.cleanup = undefined;
+    }
+  });
+  return operation.cleanup;
 }
 
 export async function turnOnSync(folder: string): Promise<{ ok: true } | { error: string }> {
   const native = SyncNative;
   if (!native) return { error: "Sync isn’t available in this build." };
-  if (recovery) return { error: "Sync is recovering. Try again after recovery finishes." };
-  configurationEpoch++;
-  const deviceId = native.newDeviceId();
-  try {
-    if (!(await native.createPhrase(deviceId))) return { error: "Couldn’t save the sync key in your Keychain." };
-    await native.createChain(folder);
-  } catch (error) {
-    await native.forget(deviceId);
-    return { error: `Couldn’t use that folder: ${errorText(error)}` };
+  if (setup?.settled && !stopOperation && !stopping) {
+    try {
+      await clearUnadoptedSetup(setup);
+    } catch (error) {
+      return { error: `Couldn’t finish the previous sync setup cleanup: ${errorText(error)}` };
+    }
   }
-  begin(folder, deviceId, false);
-  return { ok: true };
+  if (recovery || setup || stopOperation || stopping) return { error: "Sync is busy. Try again when the current operation finishes." };
+  const target = doc;
+  const epoch = ++configurationEpoch;
+  const deviceId = native.newDeviceId();
+  let finish!: () => void;
+  const operation: SetupOperation = { done: new Promise<void>((resolve) => { finish = resolve; }), target, targetFolder: doc.folder, targetDevice: doc.deviceId, deviceId, created: false, adopted: false, settled: false };
+  setup = operation;
+  const current = () => doc === target && configurationEpoch === epoch && !stopOperation && !stopping;
+  try {
+    operation.created = await native.createPhrase(deviceId);
+    if (!operation.created) return { error: "Couldn’t save the sync key in your Keychain." };
+    if (!current()) return { error: "Sync changed before setup finished." };
+    await native.createChain(folder);
+    if (!current()) return { error: "Sync changed before setup finished." };
+    begin(folder, deviceId, false);
+    operation.adopted = true;
+    return { ok: true };
+  } catch (error) {
+    return { error: `Couldn’t use that folder: ${errorText(error)}` };
+  } finally {
+    try {
+      await clearUnadoptedSetup(operation);
+    } catch (error) {
+      return { error: `Couldn’t finish sync setup cleanup: ${errorText(error)}` };
+    } finally {
+      operation.settled = true;
+      if (setup === operation && (!operation.created || operation.adopted)) setup = null;
+      finish();
+    }
+  }
 }
 
 export async function enterRecoveryPhrase(folder: string, text: string): Promise<PhraseResult | { error: "unavailable" }> {
   const native = SyncNative;
-  if (!native || recovery || stopping) return { error: "unavailable" };
+  if (!native || recovery || setup || stopping || stopOperation) return { error: "unavailable" };
   const target = doc;
   const epoch = configurationEpoch;
   const targetFolder = doc.folder;
   const targetDevice = doc.deviceId;
+  const booting = startup;
   const joining = !(doc.enabled && targetDevice);
   const current = () => doc === target && configurationEpoch === epoch && !stopping && doc.folder === targetFolder && doc.deviceId === targetDevice;
-  const operation = { changingKey: false, deferredSave: false };
+  let finish!: () => void;
+  const operation: RecoveryOperation = { changingKey: false, deferredSave: false, done: new Promise<void>((resolve) => { finish = resolve; }) };
   recovery = operation;
   clearTimeout(timer);
   let deadline: ReturnType<typeof setTimeout> | undefined;
@@ -797,11 +892,15 @@ export async function enterRecoveryPhrase(folder: string, text: string): Promise
       await Promise.race([
         (async () => {
           if (currentCycle) await currentCycle;
+          if (recovery !== operation || !current()) return;
+          if (booting) await booting.done;
+          if (recovery !== operation || !current()) return;
           operation.changingKey = true;
           let writing: Promise<void>;
           do {
             writing = stateWriter;
             await writing;
+            if (recovery !== operation || !current()) return;
           } while (writing !== stateWriter);
         })(),
         new Promise<never>((_, reject) => { deadline = setTimeout(() => reject(new Error("Sync is still busy. Try your recovery phrase again.")), 10_000); }),
@@ -814,9 +913,10 @@ export async function enterRecoveryPhrase(folder: string, text: string): Promise
     const result = await native.enterPhrase(deviceId, text, joining ? folder : targetFolder ?? folder);
     if (!current()) return { error: "unavailable" };
     if ("ok" in result) {
-      if (joining) begin(folder, deviceId, true);
-      else if (!stateReady) {
-        if (!await loadState() || !current()) return { error: "unavailable" };
+      if (joining) {
+        operation.joined = begin(folder, deviceId, true);
+      } else if (!stateReady) {
+        if (!await loadState(current) || !current()) return { error: "unavailable" };
         stateReady = true;
         publishUi({ status: "starting", error: null });
       }
@@ -826,44 +926,147 @@ export async function enterRecoveryPhrase(folder: string, text: string): Promise
     if (current()) publishUi({ status: "stalled", error: errorText(error) });
     return { error: "unavailable" };
   } finally {
-    recovery = null;
-    if (operation.deferredSave) save();
-    scheduleSync(0);
+    try {
+      if (recovery === operation) {
+        recovery = null;
+        if (operation.deferredSave) save();
+        scheduleSync(0);
+      }
+    } finally {
+      finish();
+    }
   }
 }
 
-export async function stopSync({ deleteData = false } = {}) {
+export function stopSync({ deleteData = false } = {}): Promise<StopResult> {
+  if (stopOperation) return stopOperation.retry?.() ?? stopOperation.result;
   const native = SyncNative;
-  if (!native || !doc.enabled) return;
-  configurationEpoch++;
-  stopping = true;
-  revokePasswords();
-  clearTimeout(timer);
-  if (currentCycle) await currentCycle;
-  try {
-    if (useSync.getState().status !== "locked") await runCycle({ retiring: true });
-  } catch {}
-  clearTimeout(timer);
-  const folder = doc.folder;
-  if (deleteData && folder) {
-    try {
-      await native.deleteChain(folder);
-    } catch (error) {
-      console.warn("[sync] deleting sync data failed", error);
-    }
-  }
-  if (doc.deviceId) await native.forget(doc.deviceId);
-  doc = { ...emptyDoc(), folder, types: doc.types };
-  stateReady = true;
-  stopping = false;
-  passwordAdapters.clear();
-  extensionAdapters.clear();
-  clearJournal();
-  save();
-  publishUi({ status: "off", error: null, passwordsPaused: false, passwordError: null });
+  if (!native) return Promise.resolve({ error: "Sync isn’t available in this build.", pending: false });
+  if (!doc.enabled && !recovery && !setup) return Promise.resolve({ ok: true });
+  const recovering = recovery;
+  const starting = setup;
+  const booting = startup;
+  let target = doc;
+  let epoch = configurationEpoch;
+  let targetFolder = doc.folder;
+  let targetDevice = doc.deviceId;
+  let finalizing = false;
+  let chainDeleted = false;
+  let keyForgotten = false;
+  let disabled = false;
+  let setupDrained = !!starting?.settled;
+  const operation: StopOperation = { result: Promise.resolve({ error: "Sync is busy.", pending: true }) };
+  stopOperation = operation;
+  const current = () => stopOperation === operation && doc === target && configurationEpoch === epoch && doc.folder === targetFolder && doc.deviceId === targetDevice;
+  const pendingSetup = () => !!starting?.created && !starting.adopted && setup === starting && doc === starting.target && doc.folder === starting.targetFolder && doc.deviceId === starting.targetDevice;
+  const check = () => {
+    if (!current()) throw new Error("Sync changed before this device could stop. Try again.");
+  };
+  const attempt = (): Promise<StopResult> => {
+    operation.retry = undefined;
+    let complete!: (result: StopResult) => void;
+    const completion = new Promise<StopResult>((resolve) => { complete = resolve; });
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    operation.result = Promise.race([
+      completion,
+      new Promise<StopResult>((resolve) => { deadline = setTimeout(() => resolve({ error: "Sync hasn’t stopped yet. It is waiting for an active operation to finish. Password sync is paused.", pending: true }), 10_000); }),
+    ]);
+    revokePasswords();
+    clearTimeout(timer);
+    let completed = false;
+    void (async (): Promise<StopResult> => {
+      try {
+        if (!finalizing) {
+          if (recovering) await recovering.done;
+          if (recovering?.joined && doc === recovering.joined.doc && configurationEpoch === recovering.joined.epoch) {
+            target = recovering.joined.doc;
+            epoch = recovering.joined.epoch;
+            targetFolder = target.folder;
+            targetDevice = target.deviceId;
+          }
+          check();
+          if (starting) {
+            await starting.done;
+            check();
+            if (!setupDrained) {
+              setupDrained = true;
+              if (starting.cleanupError) throw new Error(starting.cleanupError);
+            }
+            await clearUnadoptedSetup(starting);
+          }
+          check();
+          if (booting) await booting.done;
+          check();
+          epoch = ++configurationEpoch;
+          stopping = true;
+          const deviceId = targetDevice;
+          if (currentCycle) await currentCycle;
+          check();
+          await stateWriter;
+          check();
+          if (target.enabled) {
+            if (!stateReady || useSync.getState().status === "locked" || !await runCycle({ retiring: true })) {
+              throw new Error("This device couldn’t retire from sync. Check the sync folder or recovery phrase, then try again.");
+            }
+            check();
+            const retired = (scope: string, key: string) => {
+              const state = target.scopes[scope];
+              return !state?.records[key]?.v && !state?.outbox.some((op) => op.k === key) && !state?.journal?.some((file) => file.ops.some((op) => op.k === key));
+            };
+            if (!retired(APP_SCOPE, `dev:${deviceId}`) || Object.values(target.profiles).some((link) => !retired(`p:${link.syncId}`, `tabs:${deviceId}`))) {
+              throw new Error("This device’s retirement hasn’t reached the sync folder. Please try again.");
+            }
+            await stateWriter;
+            check();
+          }
+          finalizing = true;
+        }
+        check();
+        if (deleteData && targetFolder && !chainDeleted) {
+          await native.deleteChain(targetFolder);
+          chainDeleted = true;
+          check();
+        }
+        if (targetDevice && !keyForgotten) {
+          await native.forget(targetDevice);
+          keyForgotten = true;
+          check();
+        }
+        if (!disabled) {
+          doc = { ...emptyDoc(), folder: targetFolder, types: target.types };
+          target = doc;
+          targetDevice = null;
+          stateReady = true;
+          passwordAdapters.clear();
+          extensionAdapters.clear();
+          disabled = true;
+        }
+        clearJournal();
+        await enqueueStateSave();
+        check();
+        publishUi({ status: "off", error: null, passwordsPaused: false, passwordError: null });
+        completed = true;
+        return { ok: true };
+      } catch (error) {
+        return { error: errorText(error), pending: current() && (finalizing || pendingSetup()) };
+      } finally {
+        clearTimeout(deadline);
+        if (stopOperation === operation) {
+          if (!completed && (finalizing || pendingSetup()) && current()) operation.retry = attempt;
+          else {
+            stopOperation = null;
+            stopping = false;
+          }
+        }
+      }
+    })().then(complete);
+    return operation.result;
+  };
+  return attempt();
 }
 
 export function setTypeSynced(type: DataType, enabled: boolean) {
+  if (stopOperation) return;
   configurationEpoch++;
   doc.types = { ...doc.types, [type]: enabled };
   if (type === "passwords") revokePasswords();
@@ -874,6 +1077,7 @@ export function setTypeSynced(type: DataType, enabled: boolean) {
 }
 
 export function setProfileSynced(profileId: string, enabled: boolean) {
+  if (stopOperation) return;
   const link = doc.profiles[profileId];
   if (!link) return;
   configurationEpoch++;
@@ -919,6 +1123,7 @@ function sharedDataChain(syncId: string): { adds: string[]; sharesWith: string |
 export const appScopeRecords = () => doc.scopes[APP_SCOPE]?.records ?? {};
 
 export function addRemoteProfile(syncId: string): string | null {
+  if (stopOperation) return null;
   if (!remoteProfileRecord(syncId) || linkedProfileId(syncId)) return null;
   const { adds, sharesWith, waitingFor } = sharedDataChain(syncId);
   if (waitingFor) return null;
@@ -946,7 +1151,7 @@ function addLinkedProfile(syncId: string, record: ProfileRecord, shareWith: stri
 }
 
 export function startSync() {
-  if (!SyncNative) return;
+  if (!SyncNative || stopOperation || setup) return;
   configurationEpoch++;
   cleanupSync?.();
   stateReady = false;
@@ -956,20 +1161,33 @@ export function startSync() {
   publishUi({ status: doc.enabled ? "starting" : "off" });
   let disposed = false;
   const startingDoc = doc;
+  const startingFolder = doc.folder;
+  const startingDevice = doc.deviceId;
   if (doc.enabled && doc.deviceId) {
+    let finish!: () => void;
+    const operation = { done: new Promise<void>((resolve) => { finish = resolve; }) };
+    startup = operation;
+    const current = () => !disposed && startup === operation && doc === startingDoc && doc.folder === startingFolder && doc.deviceId === startingDevice;
     void SyncNative.unlock(doc.deviceId).then(async (ok) => {
-      if (disposed || doc !== startingDoc) return;
+      if (!current()) return;
       if (!ok) return publishUi({ status: "locked", error: "Enter your recovery phrase to keep syncing on this Mac." });
-      if (!await loadState()) return;
-      if (disposed || doc !== startingDoc) return;
+      if (currentCycle) await currentCycle;
+      if (!current()) return;
+      await stateWriter;
+      if (!current()) return;
+      if (!await loadState(current)) return;
+      if (!current()) return;
       stateReady = true;
       settleAppliedThemes(doc.scopes[APP_SCOPE]);
       publishUi();
       scheduleSync(500);
     }).catch((error) => {
-      if (disposed || doc !== startingDoc) return;
+      if (!current()) return;
       stateReady = false;
       publishUi({ status: "stalled", error: errorText(error) });
+    }).finally(() => {
+      if (startup === operation) startup = null;
+      finish();
     });
   }
   const subscription = SyncNative.addListener?.("onPasswordSyncInvalidated", () => {
@@ -985,6 +1203,10 @@ export function startSync() {
     configurationEpoch++;
     disposed = true;
     stateReady = false;
+    if (stopOperation?.retry) {
+      stopOperation = null;
+      stopping = false;
+    }
     revokePasswords();
     clearTimeout(timer);
     subscription?.remove();
