@@ -64,10 +64,10 @@ int main() {
   assert(!Supported({first, {u"fixture", {"https://\xc3\xa9.example"}}}));
 
   const char* cases[] = {
-      R"({"origin":"https://first.example","username":"fixture","expectedPresent":false,"desiredPresent":true,"expectedPassword":null,"desiredPassword":"fixture-desired"})",
-      R"({"origin":"https://first.example","username":"fixture","expectedPresent":true,"desiredPresent":true,"expectedPassword":"fixture-old","desiredPassword":"fixture-new"})",
-      R"({"origin":"https://first.example","username":"fixture","expectedPresent":true,"desiredPresent":false,"expectedPassword":"fixture-old","desiredPassword":null})",
-      R"({"origin":"https://first.example","username":"fixture","expectedPresent":true,"desiredPresent":true,"expectedPassword":"fixture-same","desiredPassword":"fixture-same"})",
+      R"({"origin":"https://first.example","username":"fixture","expectedPresent":false,"desiredPresent":true,"expectedPassword":null,"desiredPassword":"test"})",
+      R"({"origin":"https://first.example","username":"fixture","expectedPresent":true,"desiredPresent":true,"expectedPassword":"old","desiredPassword":"new"})",
+      R"({"origin":"https://first.example","username":"fixture","expectedPresent":true,"desiredPresent":false,"expectedPassword":"old","desiredPassword":null})",
+      R"({"origin":"https://first.example","username":"fixture","expectedPresent":true,"desiredPresent":true,"expectedPassword":"test","desiredPassword":"test"})",
       R"({"origin":"https://first.example","username":"fixture","expectedPresent":false,"desiredPresent":false,"expectedPassword":null,"desiredPassword":null})",
       "{}",
       nullptr,
