@@ -30,6 +30,22 @@ Chromium's null time is also rejected rather than silently becoming unknown.
 Storage preserves the current
 database creation date on update.
 
+Outgoing snapshots serialize the selected `CredentialUIEntry.creation_time`
+through `SerializeSyncCreationTime` in the real read loop. Missing optional/native
+null remains unknown; Unix epoch zero is known. The helper uses the pinned
+`base::Time::InMillisecondsFSinceUnixEpochIgnoringNull()` double getter, not the
+integer getter or the null-preserving floating getter (`base/time/time.h`
+703–713, 1163–1169 at Chromium 155.0.8059.84). It rejects nonfinite, out-of-range
+and sentinel-valued known output as an error distinct from unknown. In particular,
+a non-null native time one microsecond before/after 1601 can round to the forbidden
+sentinel as a double; the snapshot then fails instead of emitting unknown metadata.
+Every syncable credential's creation metadata is validated before any row is sent.
+The unchanged native buffer still discards any failed/revoked collection.
+
+The UI aggregation selects `credentials[0].date_created`; this preserves that
+selected representable date, not every aggregated row's timestamp. Double Unix
+milliseconds do not promise a universal microsecond-perfect round trip.
+
 `DispatchSyncMutation` calls the pinned `PasswordStoreInterface::CompareAndSetLogin`
 with `ConditionalLoginMutation`, `PasswordStoreAuthorizationLease` and its actual
 status callback. Neither presenter data nor cached credential presence is used
@@ -150,9 +166,26 @@ The exact read-submission body is also compiled against fixture factories for al
 four store topologies: a second store prevents presenter access, rows and successful
 completion rather than silently filtering the account side.
 
-`password_sync_adapter_unittests` defines ten unexecuted Chromium gtests against
+The complete production `ac_passwords_sync_read` body is additionally extracted
+without rewriting and compiled with fixture credential/time/request types under
+ASan/UBSan. Its actual row callback preserves positive/negative fractional dates,
+keeps unknown distinct from known Unix zero, and rejects nonfinite/bounds/sentinel
+errors across the whole collection before publishing a valid earlier row. The same
+production serialization helper is used by that body. This is a source-fragment
+fixture, not real Chromium or a real profile. Before the repair, the new regression
+reproduced `1234567890123.5 -> 1234567890123`, `-1.5 -> -1` and `+/-0.5 -> 0`.
+The serialization follow-up passed seven pre-change focused checks, then eight
+post-change focused checks, then nine final nearby checks including the unchanged
+linked native all-or-discard buffer regression. No full native suite or app build
+was rerun for this serialization-only change.
+
+`password_sync_adapter_unittests` defines twelve unexecuted Chromium gtests against
 the real parser, real candidate authorization-lease types, real `LoginDatabase`
 creation-date preservation, and real `SingleThreadTaskExecutor` destruction.
+The outgoing definitions use actual `base::Time` for fractional dates, unknown/null
+versus Unix zero, both finite range limits/overflows, 1601-adjacent milliseconds,
+native null +/- one microsecond, and infinite extrema. These new definitions have
+not been compiled or executed against Chromium.
 The standalone target explicitly owns every reused local header and declares its
 storage/OSCrypt test dependencies. The include-graph/source review is not a
 successful GN generation or C++ build. The test translation

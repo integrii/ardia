@@ -2,6 +2,7 @@
 
 #include "chrome/browser/ardia/ac_passwords_sync_adapter.h"
 #include "chrome/browser/ardia/ac_passwords_sync_input.h"
+#include "chrome/browser/ardia/ac_passwords_sync_policy.h"
 
 #include <atomic>
 #include <cassert>
@@ -568,8 +569,183 @@ void LostReplyShutdown() {
 
 }
 
+#ifdef ARDIA_TEST_OUTGOING_READ
+namespace base {
+
+std::string UTF16ToUTF8(const std::u16string& text) {
+  return std::string(text.begin(), text.end());
+}
+
+auto BindOnce(auto callback) { return callback; }
+
+}
+
+using Entries = std::vector<int>;
+
+namespace ardia {
+
+struct OutgoingFixtureTime {
+  double milliseconds = 0;
+  bool null = false;
+  bool is_null() const { return null; }
+  int64_t InMillisecondsSinceUnixEpoch() const {
+    return static_cast<int64_t>(milliseconds);
+  }
+  double InMillisecondsFSinceUnixEpochIgnoringNull() const {
+    return milliseconds;
+  }
+};
+
+struct OutgoingCredential {
+  std::u16string username = u"fixture";
+  std::u16string password = u"secret";
+  std::optional<OutgoingFixtureTime> creation_time;
+  std::set<std::string> origins{"https://adapter.example"};
+  bool syncable = true;
+};
+
+std::vector<OutgoingCredential> outgoing_credentials;
+
+struct SyncCredentials {
+  explicit SyncCredentials(int*) : entries(outgoing_credentials) {}
+  std::vector<OutgoingCredential> entries;
+};
+
+bool Syncable(const OutgoingCredential& credential) { return credential.syncable; }
+auto SyncOrigins(const OutgoingCredential& credential) { return credential.origins; }
+
+class Secret {
+ public:
+  explicit Secret(std::string text) : text_(std::move(text)) {}
+  const std::string& value() const { return text_; }
+ private:
+  std::string text_;
+};
+
+struct OutgoingSession {
+  std::shared_ptr<int> delegate = std::make_shared<int>(0);
+};
+
+struct SyncRequest {
+  std::optional<OutgoingSession> session{std::in_place};
+  ac_passwords_sync_login_t login;
+  ac_passwords_sync_done_t done;
+  void* context;
+  bool Allowed() const { return true; }
+  void Finish(bool status) { done(context, status ? 1 : 0); }
+  bool Send(const ac_passwords_sync_login& row) {
+    login(context, &row);
+    return true;
+  }
+};
+
+auto BeginSync(const char*, ac_passwords_sync_authorized_t,
+               ac_passwords_sync_login_t login,
+               ac_passwords_sync_done_t done, void* context) {
+  auto request = std::make_shared<SyncRequest>();
+  request->login = login;
+  request->done = done;
+  request->context = context;
+  return request;
+}
+
+void WithSyncList(std::shared_ptr<SyncRequest> request, auto callback) {
+  callback(std::move(request), Entries{});
+}
+
+}
+
+#include "password_sync_read_body.inc"
+
+namespace {
+
+struct OutgoingRows {
+  std::vector<std::pair<bool, double>> dates;
+  int dones = 0;
+  int status = 99;
+};
+
+OutgoingRows ReadOutgoing(std::vector<ardia::OutgoingCredential> credentials) {
+  ardia::outgoing_credentials = std::move(credentials);
+  OutgoingRows rows;
+  ac_passwords_sync_read(nullptr, nullptr,
+      [](void* context, const ac_passwords_sync_login* row) {
+        auto& result = *static_cast<OutgoingRows*>(context);
+        result.dates.emplace_back(row->has_created != 0, row->created_ms);
+      }, [](void* context, int status) {
+        auto& result = *static_cast<OutgoingRows*>(context);
+        ++result.dones;
+        result.status = status;
+      }, &rows);
+  assert(rows.dones == 1);
+  return rows;
+}
+
+ardia::OutgoingCredential OutgoingDate(double milliseconds, bool null = false) {
+  ardia::OutgoingCredential credential;
+  credential.creation_time = ardia::OutgoingFixtureTime{milliseconds, null};
+  return credential;
+}
+
+void OutgoingPrecision() {
+  const std::vector<double> fractions{1234567890123.5, -1234567890123.5, -1.5, 0.5, -0.5};
+  bool exact = true;
+  for (double milliseconds : fractions) {
+    auto rows = ReadOutgoing({OutgoingDate(milliseconds)});
+    assert(rows.status == 1 && rows.dates.size() == 1 && rows.dates[0].first);
+    printf("Actual extracted read: %.17g -> %.17g\n", milliseconds, rows.dates[0].second);
+    exact &= rows.dates[0].second == milliseconds;
+  }
+  fflush(stdout);
+  assert(exact);
+  for (double milliseconds : {0.0, -8640000000000000.0, 8640000000000000.0,
+       -11644473600001.0, -11644473599999.0}) {
+    auto rows = ReadOutgoing({OutgoingDate(milliseconds)});
+    assert(rows.status == 1 && rows.dates.size() == 1 && rows.dates[0].first);
+    assert(rows.dates[0].second == milliseconds);
+  }
+  for (auto credential : {ardia::OutgoingCredential{}, OutgoingDate(0, true),
+       OutgoingDate(std::numeric_limits<double>::quiet_NaN(), true)}) {
+    auto rows = ReadOutgoing({credential});
+    assert(rows.status == 1 && rows.dates.size() == 1);
+    assert(!rows.dates[0].first && rows.dates[0].second == 0);
+  }
+  for (double milliseconds : {-11644473600000.0,
+       std::nextafter(8640000000000000.0, std::numeric_limits<double>::infinity()),
+       std::nextafter(-8640000000000000.0, -std::numeric_limits<double>::infinity()),
+       std::numeric_limits<double>::quiet_NaN(),
+       std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()}) {
+    auto invalid = OutgoingDate(milliseconds);
+    invalid.username = u"invalid";
+    auto rows = ReadOutgoing({OutgoingDate(0.5), invalid});
+    assert(rows.status == 0 && rows.dates.empty());
+    rows = ReadOutgoing({invalid, OutgoingDate(0.5)});
+    assert(rows.status == 0 && rows.dates.empty());
+    invalid.syncable = false;
+    rows = ReadOutgoing({OutgoingDate(0.5), invalid});
+    assert(rows.status == 1 && rows.dates.size() == 1);
+  }
+  for (int64_t internal_microseconds : {-1, 1}) {
+    const double milliseconds =
+        static_cast<double>(internal_microseconds - 11644473600000000LL) / 1000.0;
+    assert(milliseconds == -11644473600000.0);
+    auto known = OutgoingDate(milliseconds);
+    const auto metadata = ardia::SerializeSyncCreationTime(known.creation_time);
+    assert(!metadata);
+    auto rows = ReadOutgoing({known});
+    assert(rows.status == 0 && rows.dates.empty());
+  }
+  puts("Production outgoing read: fractions, unknown/null/Unix zero, bounds and whole-snapshot refusal passed (extracted body, fixture time, not Chromium)");
+}
+
+}
+#endif
+
 int main() {
   @autoreleasepool {
+#ifdef ARDIA_TEST_OUTGOING_READ
+    OutgoingPrecision();
+#endif
     ParserBoundary();
     Handoff();
     ConcurrentRevocation();

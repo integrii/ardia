@@ -51,6 +51,28 @@ for (const sanitizer of ["address,undefined", "thread"]) {
   });
 }
 
+test("production outgoing read preserves selected fractional creation metadata", () => {
+  const scratch = mkdtempSync(join(process.env.ARDIA_NATIVE_POLICY_SCRATCH ?? tmpdir(), "ardia-password-outgoing-date-"));
+  try {
+    writeFileSync(join(scratch, "password_sync_read_body.inc"), source.slice(
+      source.indexOf('extern "C" AC_ENGINE_EXPORT void ac_passwords_sync_read('),
+      source.indexOf('extern "C" AC_ENGINE_EXPORT void ac_passwords_sync_compare_and_set(')));
+    const binary = join(scratch, "outgoing-date-test");
+    const compiled = spawnSync(process.env.CXX ?? "clang++", [
+      "-std=c++20", "-fobjc-arc", "-fblocks", "-Wall", "-Wextra", "-Werror", "-pthread",
+      "-fsanitize=address,undefined", "-DARDIA_TEST_OUTGOING_READ=1",
+      "-I", join(root, "engine/chromium/src"), "-I", scratch,
+      join(directory, "PasswordSyncEngineAdapterTests.mm"), "-framework", "Foundation", "-o", binary,
+    ], { encoding: "utf8", timeout: 120_000 });
+    assert.equal(compiled.status, 0, compiled.error?.message ?? compiled.stderr);
+    const executed = spawnSync(binary, [], { encoding: "utf8", timeout: 30_000 });
+    assert.equal(executed.status, 0, executed.error?.message ?? executed.stdout + executed.stderr);
+    assert.match(executed.stdout, /Production outgoing read: fractions, unknown\/null\/Unix zero, bounds and whole-snapshot refusal passed/);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
 test("production adapter source uses pinned CAS, original deadline, and synchronous profile revocation", () => {
   const handoff = source.slice(source.indexOf("[[maybe_unused]] void BeginSyncMutation("), source.indexOf("using ardia::Call;"));
   assert.match(handoff, /const base::TimeTicks deadline = base::TimeTicks::Now\(\) \+ base::Seconds\(10\)/);
@@ -109,6 +131,9 @@ test("native read validates the whole collection before sending any rows", () =>
     source.indexOf('extern "C" AC_ENGINE_EXPORT void ac_passwords_sync_compare_and_set('));
   assert.match(read, /SyncCredentials credentials[^;]*;\s*if \(!ardia::SyncSnapshotSupported\(credentials\.entries, ardia::Syncable,\s*ardia::SyncOrigins\)\) \{\s*return request->Finish\(false\);\s*\}\s*for \(const auto& credential : credentials\.entries\)/);
   assert.ok(read.indexOf("SyncSnapshotSupported") < read.indexOf("request->Send(row)"));
+  assert.match(read, /for \(const auto& credential : credentials\.entries\) \{\s*if \(ardia::Syncable\(credential\) &&\s*!ardia::SerializeSyncCreationTime\(credential\.creation_time\)\) \{\s*return request->Finish\(false\);\s*\}\s*\}\s*for/);
+  assert.match(read, /created->has_created \? 1 : 0, created->created_ms/);
+  assert.doesNotMatch(read, /InMillisecondsSinceUnixEpoch\(|InMillisecondsFSinceUnixEpoch\(/);
 });
 
 test("production read request preserves old Boolean-status consumers", () => {

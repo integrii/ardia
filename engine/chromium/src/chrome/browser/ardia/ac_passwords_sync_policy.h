@@ -1,11 +1,32 @@
 #ifndef CHROME_BROWSER_ARDIA_AC_PASSWORDS_SYNC_POLICY_H_
 #define CHROME_BROWSER_ARDIA_AC_PASSWORDS_SYNC_POLICY_H_
 
+#include <cmath>
+#include <optional>
 #include <set>
 #include <string>
 #include <utility>
 
 namespace ardia {
+
+struct SyncCreatedMetadata {
+  bool has_created = false;
+  double created_ms = 0;
+};
+
+template <typename Time>
+std::optional<SyncCreatedMetadata> SerializeSyncCreationTime(
+    const std::optional<Time>& time) {
+  if (!time || time->is_null()) {
+    return SyncCreatedMetadata{};
+  }
+  const double milliseconds = time->InMillisecondsFSinceUnixEpochIgnoringNull();
+  if (!std::isfinite(milliseconds) || std::abs(milliseconds) > 8640000000000000.0 ||
+      milliseconds == -11644473600000.0) {
+    return std::nullopt;
+  }
+  return SyncCreatedMetadata{true, milliseconds};
+}
 
 inline bool SyncOriginSupported(const std::string& origin) {
   const size_t authority = origin.starts_with("https://") ? 8 :

@@ -1,5 +1,6 @@
 #include "chrome/browser/ardia/ac_passwords_sync_adapter.h"
 #include "chrome/browser/ardia/ac_passwords_sync_mutation.h"
+#include "chrome/browser/ardia/ac_passwords_sync_policy.h"
 
 #include <cmath>
 #include <limits>
@@ -182,6 +183,50 @@ TEST_F(PasswordSyncAdapterTest, ParserPreservesRepresentableFractionalDates) {
     ASSERT_TRUE(parsed);
     EXPECT_DOUBLE_EQ((parsed->date_created - base::Time::UnixEpoch()).InMillisecondsF(),
                      milliseconds);
+  }
+}
+
+TEST_F(PasswordSyncAdapterTest, OutgoingCreationPreservesSelectedRepresentableDate) {
+  for (double milliseconds : {1234567890123.5, -1234567890123.5, 0.5, -0.5,
+       -1.5, 0.0, -8640000000000000.0, 8640000000000000.0,
+       -11644473600001.0, -11644473599999.0}) {
+    const auto time = base::Time::FromMillisecondsSinceUnixEpoch(milliseconds);
+    ASSERT_FALSE(time.is_null());
+    auto metadata = SerializeSyncCreationTime(std::optional(time));
+    ASSERT_TRUE(metadata);
+    EXPECT_TRUE(metadata->has_created);
+    EXPECT_DOUBLE_EQ(metadata->created_ms, milliseconds);
+  }
+  for (const auto& time : {std::optional<base::Time>{}, std::optional(base::Time())}) {
+    auto metadata = SerializeSyncCreationTime(time);
+    ASSERT_TRUE(metadata);
+    EXPECT_FALSE(metadata->has_created);
+    EXPECT_DOUBLE_EQ(metadata->created_ms, 0);
+  }
+}
+
+TEST_F(PasswordSyncAdapterTest, OutgoingCreationRejectsKnownUnrepresentableDate) {
+  for (double milliseconds : {-8640000000000001.0, 8640000000000001.0}) {
+    const auto time = base::Time::FromMillisecondsSinceUnixEpoch(milliseconds);
+    ASSERT_FALSE(time.is_null());
+    EXPECT_FALSE(SerializeSyncCreationTime(std::optional(time)));
+  }
+  for (const auto time : {base::Time::Min(), base::Time::Max()}) {
+    ASSERT_FALSE(time.is_null());
+    EXPECT_FALSE(SerializeSyncCreationTime(std::optional(time)));
+  }
+  for (int microseconds : {-1, 1}) {
+    const auto time = base::Time::FromDeltaSinceWindowsEpoch(base::Microseconds(microseconds));
+    ASSERT_FALSE(time.is_null());
+    EXPECT_DOUBLE_EQ(time.InMillisecondsFSinceUnixEpochIgnoringNull(), -11644473600000.0);
+    EXPECT_FALSE(SerializeSyncCreationTime(std::optional(time)));
+  }
+  for (int milliseconds : {-1, 1}) {
+    const auto time = base::Time::FromDeltaSinceWindowsEpoch(base::Milliseconds(milliseconds));
+    auto metadata = SerializeSyncCreationTime(std::optional(time));
+    ASSERT_TRUE(metadata);
+    EXPECT_TRUE(metadata->has_created);
+    EXPECT_DOUBLE_EQ(metadata->created_ms, -11644473600000.0 + milliseconds);
   }
 }
 

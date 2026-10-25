@@ -840,6 +840,12 @@ extern "C" AC_ENGINE_EXPORT void ac_passwords_sync_read(
           return request->Finish(false);
         }
         for (const auto& credential : credentials.entries) {
+          if (ardia::Syncable(credential) &&
+              !ardia::SerializeSyncCreationTime(credential.creation_time)) {
+            return request->Finish(false);
+          }
+        }
+        for (const auto& credential : credentials.entries) {
           if (!ardia::Syncable(credential)) {
             continue;
           }
@@ -848,8 +854,10 @@ extern "C" AC_ENGINE_EXPORT void ac_passwords_sync_read(
           }
           ardia::Secret password(base::UTF16ToUTF8(credential.password));
           const std::string username = base::UTF16ToUTF8(credential.username);
-          const bool has_created = credential.creation_time.has_value() && !credential.creation_time->is_null();
-          const double created_ms = has_created ? credential.creation_time->InMillisecondsSinceUnixEpoch() : 0;
+          const auto created = ardia::SerializeSyncCreationTime(credential.creation_time);
+          if (!created) {
+            return request->Finish(false);
+          }
           const auto origins = ardia::SyncOrigins(credential);
           if (origins.empty()) {
             return request->Finish(false);
@@ -857,7 +865,8 @@ extern "C" AC_ENGINE_EXPORT void ac_passwords_sync_read(
           for (const auto& origin : origins) {
             ac_passwords_sync_login row{
                 origin.data(), origin.size(), username.data(), username.size(),
-                password.value().data(), password.value().size(), has_created ? 1 : 0, created_ms};
+                password.value().data(), password.value().size(),
+                created->has_created ? 1 : 0, created->created_ms};
             if (!request->Send(row)) {
               return request->Finish(false);
             }
