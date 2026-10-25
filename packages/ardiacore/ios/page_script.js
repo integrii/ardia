@@ -248,6 +248,7 @@
   let eyeHost = null;
   let eyeButton = null;
   const isPassword = (el) => el.type === "password" || el === revealedField;
+  const isAutofilled = (el) => el.matches(":autofill");
   const EYE =
     '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 8s2.4-4.5 6.5-4.5S14.5 8 14.5 8s-2.4 4.5-6.5 4.5S1.5 8 1.5 8Z"/><circle cx="8" cy="8" r="2.1"/></svg>';
   const EYE_SLASH =
@@ -298,6 +299,11 @@
       e.stopPropagation();
       const el = eyeField;
       if (!el) return;
+      if (isAutofilled(el)) {
+        typedByUser.delete(el);
+        conceal();
+        return hideEye();
+      }
       const [start, end] = [el.selectionStart, el.selectionEnd];
       if (revealedField === el) conceal();
       else {
@@ -316,6 +322,11 @@
   };
   const updateEye = guard(() => {
     const el = document.activeElement;
+    if (el instanceof HTMLInputElement && isPassword(el) && isAutofilled(el)) {
+      typedByUser.delete(el);
+      conceal();
+      return hideEye();
+    }
     const show = el instanceof HTMLInputElement && isPassword(el) && el.value && typedByUser.has(el) && el.getBoundingClientRect().width >= 80;
     if (!show) return hideEye();
     if (eyeField !== el && hasOwnToggle(el)) return hideEye();
@@ -329,7 +340,7 @@
     guard((e) => {
       const el = e.target;
       if (!(el instanceof HTMLInputElement) || !isPassword(el)) return;
-      if (!el.value) typedByUser.delete(el);
+      if (!el.value || isAutofilled(el)) typedByUser.delete(el);
       else if (e.isTrusted) typedByUser.add(el);
       updateEye();
     }),
