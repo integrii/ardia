@@ -33,7 +33,7 @@ export function showRecoveryKit() {
   showSettingsSheet(<RecoveryKitSheet />);
 }
 
-function useRecoveryAccess(clear: () => void) {
+function useRecoveryAccess(clear: () => void, defaultError = "Couldn’t open the recovery kit. Please try again.") {
   const current = useRef({ alive: true, generation: 0, unlocked: false, busy: false });
   const clearRef = useRef(clear);
   clearRef.current = clear;
@@ -86,7 +86,7 @@ function useRecoveryAccess(clear: () => void) {
       else if (result === false && message) setError(message);
       else accept?.(result);
     } catch {
-      if (valid()) setError(failure() ?? "Couldn’t open the recovery kit. Please try again.");
+      if (valid()) setError(failure() ?? defaultError);
     } finally {
       if (valid()) {
         current.current.busy = false;
@@ -280,7 +280,7 @@ function ConnectDeviceSheet() {
   const colors = useFormColors();
   const [qr, setQr] = useState<string | null>(null);
   const [words, setWords] = useState<string[] | null>(null);
-  const access = useRecoveryAccess(() => { setQr(null); setWords(null); });
+  const access = useRecoveryAccess(() => { setQr(null); setWords(null); }, "Couldn’t show the recovery code. Please try again.");
   const unlock = () => access.run(async () => SyncNative?.qrCode(), setQr, true);
   return (
     <Sheet width={480} onClose={access.close}>

@@ -18,7 +18,7 @@ const deferred = () => {
   const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
   return { promise, resolve, reject };
 };
-function setup() {
+function setup(component) {
   const auth = deferred();
   const authorizations = [auth];
   let invalidate;
@@ -52,7 +52,17 @@ function setup() {
   };
   vm.createContext(context);
   vm.runInContext(compiled, context);
-  const access = context.makeAccess(() => { clears++; rendered = null; });
+  let makeAccess = context.makeAccess;
+  if (component) {
+    const sheet = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === component);
+    const declaration = sheet?.body.statements.find(node => ts.isVariableStatement(node) && node.declarationList.declarations[0].name.getText(ast) === "access");
+    const call = declaration?.declarationList.declarations[0].initializer;
+    assert.ok(call && ts.isCallExpression(call) && call.expression.getText(ast) === "useRecoveryAccess");
+    const options = call.arguments.slice(1).map(argument => ", " + argument.getText(ast)).join("");
+    vm.runInContext("globalThis.makeSheetAccess = clear => useRecoveryAccess(clear" + options + ");", context);
+    makeAccess = context.makeSheetAccess;
+  }
+  const access = makeAccess(() => { clears++; rendered = null; });
   return {
     access, auth, states, native: context.SyncNative, invalidate: () => invalidate(), cleanup: () => cleanup(),
     clears: () => clears, revocations: () => revocations, closed: () => closed,
@@ -61,7 +71,7 @@ function setup() {
   };
 }
 
-function setupSheetCopy(test, component, title, response, choice = "copy") {
+function setupSheetButton(test, component, title, response, choice = "copy") {
   const sheet = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === component);
   assert.ok(sheet);
   let press;
@@ -69,7 +79,10 @@ function setupSheetCopy(test, component, title, response, choice = "copy") {
     if (ts.isJsxSelfClosingElement(node) && node.tagName.getText(ast) === "Button") {
       const attributes = node.attributes.properties;
       const label = attributes.find(attribute => ts.isJsxAttribute(attribute) && attribute.name.getText(ast) === "title");
-      if (label?.initializer && ts.isStringLiteral(label.initializer) && label.initializer.text === title) {
+      const initializer = label?.initializer;
+      const text = initializer && ts.isStringLiteral(initializer) ? initializer.text
+        : initializer && ts.isJsxExpression(initializer) && initializer.expression && ts.isConditionalExpression(initializer.expression) && ts.isStringLiteral(initializer.expression.whenFalse) ? initializer.expression.whenFalse.text : null;
+      if (text === title) {
         press = attributes.find(attribute => ts.isJsxAttribute(attribute) && attribute.name.getText(ast) === "onPress")?.initializer?.expression;
       }
     }
@@ -78,6 +91,7 @@ function setupSheetCopy(test, component, title, response, choice = "copy") {
   find(sheet);
   assert.ok(press, title + " retains its production button callback");
   const more = sheet.body.statements.find(node => ts.isVariableStatement(node) && node.declarationList.declarations[0].name.getText(ast) === "more");
+  const unlock = sheet.body.statements.find(node => ts.isVariableStatement(node) && node.declarationList.declarations[0].name.getText(ast) === "unlock");
   let pending;
   const calls = [];
   const copy = (...args) => { calls.push(args); return response(); };
@@ -86,9 +100,10 @@ function setupSheetCopy(test, component, title, response, choice = "copy") {
   const context = {
     access: { ...test.access, run: (...args) => { pending = test.access.run(...args); return pending; } },
     SyncNative: test.native, showMenu: async () => choice, setSaved: () => {},
+    words: null, setWords: test.render, setQr: test.render, setPreview: test.render,
   };
   vm.createContext(context);
-  const callback = (more ? more.getText(ast) + "\n" : "") + "globalThis.press = " + press.getText(ast) + ";";
+  const callback = (more ? more.getText(ast) + "\n" : "") + (unlock ? unlock.getText(ast) + "\n" : "") + "globalThis.press = " + press.getText(ast) + ";";
   vm.runInContext(ts.transpileModule(callback, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context);
   return { calls, press: async () => { context.press(); assert.ok(pending); await pending; } };
 }
@@ -372,23 +387,23 @@ fs.writeFileSync(output, "#!/bin/bash\\nexit 0\\n", { mode: 0o700 });
     ["RecoveryKitSheet", "Other Options", "kit", []],
   ]) {
     for (const result of [false, null, undefined, new Error("clipboard failed"), true]) {
-      const test = setup();
+      const test = setup(component);
       const unlock = test.access.run(async () => "unlocked mock", undefined, true);
       test.auth.resolve(true);
       await unlock;
-      const button = setupSheetCopy(test, component, title, () => result instanceof Error ? Promise.reject(result) : Promise.resolve(result));
+      const button = setupSheetButton(test, component, title, () => result instanceof Error ? Promise.reject(result) : Promise.resolve(result));
       await button.press();
       assert.deepEqual(button.calls, [args]);
       assert.equal(test.states[1], false);
       if (result === true) assert.equal(test.states[2], null);
       else assert.match(test.states[2], new RegExp("Recovery " + label + " wasn’t copied"));
     }
-    const test = setup();
+    const test = setup(component);
     const unlock = test.access.run(async () => "unlocked mock", undefined, true);
     test.auth.resolve(true);
     await unlock;
     const copy = deferred();
-    const button = setupSheetCopy(test, component, title, () => copy.promise);
+    const button = setupSheetButton(test, component, title, () => copy.promise);
     const pending = button.press();
     await new Promise(resolve => setImmediate(resolve));
     test.invalidate();
@@ -402,12 +417,55 @@ fs.writeFileSync(output, "#!/bin/bash\\nexit 0\\n", { mode: 0o700 });
     const unlock = test.access.run(async () => "unlocked mock", undefined, true);
     test.auth.resolve(true);
     await unlock;
-    const button = setupSheetCopy(test, "RecoveryKitSheet", "Other Options", () => Promise.resolve(false), null);
+    const button = setupSheetButton(test, "RecoveryKitSheet", "Other Options", () => Promise.resolve(false), null);
     await button.press();
     assert.equal(button.calls.length, 0);
     assert.equal(test.states[2], null);
   }
-  console.log("PASS: 27 production recovery UI scenarios; action-specific copy feedback, actual sheet buttons, stale failures, success, dismissal and scoped cleanup");
+  for (const operation of ["authorization", "qrCode", "recoveryWords"]) {
+    for (const stale of [false, true]) {
+      const test = setup("ConnectDeviceSheet");
+      test.native.qrCode = async () => "mock device code";
+      let button = setupSheetButton(test, "ConnectDeviceSheet", "Unlock Recovery Phrase", () => Promise.resolve(true));
+      let failure;
+      if (operation === "authorization") failure = test.auth;
+      else if (operation === "qrCode") {
+        failure = deferred();
+        test.native.qrCode = () => failure.promise;
+        test.auth.resolve(true);
+      } else {
+        test.auth.resolve(true);
+        await button.press();
+        failure = deferred();
+        test.native.recoveryWords = () => failure.promise;
+        button = setupSheetButton(test, "ConnectDeviceSheet", "Show Words", () => Promise.resolve(true));
+      }
+      const pending = button.press();
+      await new Promise(resolve => setImmediate(resolve));
+      if (stale) test.invalidate();
+      failure.reject(new Error("device code failure"));
+      await pending;
+      if (stale) assert.equal(test.states[2], null);
+      else assert.equal(test.states[2], "Couldn’t show the recovery code. Please try again.");
+      assert.equal(test.states[1], false);
+    }
+  }
+  for (const operation of ["authorization", "preview"]) {
+    const test = setup("RecoveryKitSheet");
+    const preview = deferred();
+    test.native.recoveryKitPreview = () => preview.promise;
+    const button = setupSheetButton(test, "RecoveryKitSheet", "Unlock Recovery Kit", () => Promise.resolve(true));
+    const pending = button.press();
+    if (operation === "authorization") test.auth.reject(new Error("kit authorization failure"));
+    else {
+      test.auth.resolve(true);
+      await new Promise(resolve => setImmediate(resolve));
+      preview.reject(new Error("kit preview failure"));
+    }
+    await pending;
+    assert.equal(test.states[2], "Couldn’t open the recovery kit. Please try again.");
+  }
+  console.log("PASS: 35 production recovery UI scenarios; sheet-specific defaults, auth/QR/words failures, copy overrides and stale-generation suppression");
   await checkRecoveryFixtureBootstrap();
   console.log("PASS: 4 production E2E bootstrap scenarios; denied words, synthetic fixture only, malformed and ambiguous fixture rejection");
   checkNativeRecoveryBoundaries();
