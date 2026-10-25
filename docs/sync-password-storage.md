@@ -66,6 +66,14 @@ the failing statement to be `COMMIT`, and checks rollback before native End. Oth
 exercise decrypt/encrypt failures with pinned OSCrypt test encryptors and tracked-sync refusal
 through the real database helper. A Python SQLite probe confirms only the deferred-constraint
 mechanism, not Chromium behavior. None of these definitions have been compiled or run.
+
+Three definitions were corrected for LoginDatabase's default exclusive SQLite locking. Native
+End now inspects the live owning connection with checked queries and transaction-state checks.
+The owner is destroyed before a separate connection checks durable disk state. The shared
+column-query helper also asserts successful query completion, so a query error cannot appear
+to be an empty table. Independent source review and fresh pinned-source application checks
+passed; a Python locking probe is mechanism evidence only, not execution of these gtests.
+
 Required runtime evidence includes queued
 and committed-but-unnotified local edits, conditional insertion/update/deletion, commit failure,
 revocation/expiry, shutdown and callback-context survival until every queued borrower drains.
