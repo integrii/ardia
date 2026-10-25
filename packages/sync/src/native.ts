@@ -20,7 +20,10 @@ export type PhraseResult =
   | { error: "mismatch" }
   | { error: "keychain" };
 
-export type SavedLogin = { origin: string; url: string; username: string; password: string; created: number };
+export type PasswordSyncValue = { version: 2; sealed: string; fingerprint: string };
+export type PasswordSyncRecord = { key: string; value: PasswordSyncValue; created: number | null };
+export type PasswordSyncChange = { key: string; desired: PasswordSyncValue | null; base: PasswordSyncValue | null };
+export type PasswordSyncProfile = { scope: string; engineProfile: string };
 
 type SyncNative = {
   folderInfo(path: string | null): Promise<FolderInfo>;
@@ -38,7 +41,8 @@ type SyncNative = {
   remove(folder: string, scope: string, ids: string[]): Promise<void>;
   deleteChain(folder: string): Promise<void>;
   sealLocal(text: string): Promise<string>;
-  openLocal(sealed: string): Promise<string | null>;
+  openLocal(sealed: string): Promise<string>;
+  addListener(event: "onPasswordSyncInvalidated", listener: () => void): { remove(): void };
   recoveryWords(): Promise<string[]>;
   qrCode(): Promise<string | null>;
   recoveryKitPreview(width: number): Promise<string | null>;
@@ -47,7 +51,11 @@ type SyncNative = {
   shareRecoveryKit(): Promise<void>;
   copyRecoveryPhrase(): Promise<void>;
   revealFolder(path: string): Promise<void>;
-  readPasswords(engineProfile: string): Promise<SavedLogin[] | null>;
+  authorizePasswordSync(folder: string, profiles: PasswordSyncProfile[]): Promise<boolean>;
+  revokePasswordSyncAuthorization(): void;
+  passwordSyncAuthorized(folder: string, scope: string, engineProfile: string): Promise<boolean>;
+  readPasswordRecords(folder: string, scope: string, engineProfile: string): Promise<PasswordSyncRecord[] | null>;
+  applyPasswordRecords(folder: string, scope: string, engineProfile: string, changes: PasswordSyncChange[]): Promise<boolean>;
 };
 
 export const SyncNative = requireOptionalNativeModule<SyncNative>("ArdiaSync");

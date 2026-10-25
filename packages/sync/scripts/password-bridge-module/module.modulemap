@@ -1,0 +1,4 @@
+module ArdiaCore {
+  header "../../../ardiacore/ios/ArdiaCoreServices.h"
+  export *
+}

@@ -59,6 +59,50 @@ export const savePassword = async (_profile, origin, username, password) => {
 };
 export const deletePassword = async (_profile, origin, username) => (logins().delete(`${origin}\n${username}`), true);
 export const readLogins = async () => [...logins().values()];
+export const passwordSyncControls = new Map();
+const passwordEnvelopes = new Map();
+const passwordFingerprints = new Map();
+let passwordNonce = 0;
+const passwordEnvelope = (scope, key, login) => {
+  const identity = JSON.stringify([scope, key, login.password]);
+  if (!passwordFingerprints.has(identity)) passwordFingerprints.set(identity, `fingerprint-${passwordFingerprints.size}`);
+  const value = { version: 2, sealed: `sealed-${++passwordNonce}`, fingerprint: passwordFingerprints.get(identity) };
+  passwordEnvelopes.set(value.sealed, { scope, key, login: { ...login }, fingerprint: value.fingerprint });
+  return value;
+};
+const openPasswordEnvelope = (scope, key, value) => {
+  if (value === null) return null;
+  const entry = passwordEnvelopes.get(value.sealed);
+  if (!entry || entry.scope !== scope || entry.key !== key || entry.fingerprint !== value.fingerprint) throw new Error("Invalid password envelope");
+  return entry.login;
+};
+export const passwordSyncBridge = {
+  readPasswordRecords: async (folder, scope, profile) => {
+    const control = passwordSyncControls.get(current.device);
+    control?.calls?.push({ op: "read", folder, scope, profile });
+    if (control?.authorized === false || control?.unavailable) return null;
+    const rows = [...logins()].map(([key, login]) => ({ key: `pw:${key}`, value: passwordEnvelope(scope, `pw:${key}`, login), created: login.created }));
+    await control?.afterRead?.();
+    return rows;
+  },
+  applyPasswordRecords: async (folder, scope, profile, changes) => {
+    const control = passwordSyncControls.get(current.device);
+    control?.calls?.push({ op: "apply", folder, scope, profile, changes });
+    if (control?.authorized === false || control?.failApply || control?.unavailable) return false;
+    const store = logins();
+    await control?.beforeApply?.();
+    for (const { key, desired, base } of changes) {
+      const want = openPasswordEnvelope(scope, key, desired);
+      const known = openPasswordEnvelope(scope, key, base);
+      const have = store.get(key.slice(3));
+      if (have?.password === want?.password) continue;
+      if (have?.password !== known?.password) return false;
+      if (want) store.set(key.slice(3), { ...want });
+      else store.delete(key.slice(3));
+    }
+    return !control?.unsettled;
+  },
+};
 
 export const historyDbs = new Map();
 export const chromeHistory = (profile = "", device = current.device) => {

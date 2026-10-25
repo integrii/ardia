@@ -9,6 +9,7 @@ import { useBrowser } from "../../../store/browser";
 import { useProfiles } from "../../../store/hooks";
 import {
   addRemoteProfile,
+  authorizePasswords,
   chooseSyncFolder,
   DATA_TYPES,
   folderInfo,
@@ -143,6 +144,8 @@ function statusLine(status: SyncStatus, lastSyncedAt: number | null, pending: nu
         return "starting up";
       case "updating":
         return "updating";
+      case "passwordsPaused":
+        return since ? `password sync paused · other data updated ${since}` : "password sync paused";
       case "offline":
         return "offline";
       case "stalled":
@@ -163,6 +166,9 @@ function SyncOn({ info }: { info: FolderInfo | null }) {
   const pending = useSync((s) => s.pending);
   const error = useSync((s) => s.error);
   const types = useSync((s) => s.types);
+  const passwordsPaused = useSync((s) => s.passwordsPaused);
+  const passwordsAuthorizing = useSync((s) => s.passwordsAuthorizing);
+  const passwordError = useSync((s) => s.passwordError);
   const links = useSync((s) => s.profiles);
   const devices = useSync((s) => s.devices);
   const remoteProfiles = useSync((s) => s.remoteProfiles);
@@ -238,7 +244,16 @@ function SyncOn({ info }: { info: FolderInfo | null }) {
       <SectionHeader title="What Syncs" />
       <Group>
         {DATA_TYPES.map((t) => (
-          <Row key={t.id} title={t.title} description={t.description}>
+          <Row
+            key={t.id}
+            title={t.title}
+            description={t.id === "passwords" && types.passwords
+              ? passwordError ?? (passwordsPaused ? "Paused. Unlock for this app session; locking your Mac pauses passwords again." : "Unlocked for this app session. Turning sync off keeps passwords on this Mac.")
+              : t.description}
+          >
+            {t.id === "passwords" && types.passwords && (passwordsPaused || passwordsAuthorizing) ? (
+              <Button title={passwordsAuthorizing ? "Unlocking…" : "Unlock Password Sync"} disabled={passwordsAuthorizing || locked} onPress={() => void authorizePasswords()} />
+            ) : null}
             <Toggle value={types[t.id]} onChange={(on) => setTypeSynced(t.id, on)} />
           </Row>
         ))}

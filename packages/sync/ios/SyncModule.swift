@@ -1,14 +1,23 @@
 import AppKit
 import ExpoModulesCore
-import ArdiaImport
-import Security
 
 public class SyncModule: Module {
   private let state = KeyState()
   private static let work = DispatchQueue(label: "ardia.sync", qos: .utility)
+  private var passwordSyncDestroyed = false
+  private var passwordSync: PasswordSyncCoordinator?
 
   public func definition() -> ModuleDefinition {
     Name("ArdiaSync")
+    Events("onPasswordSyncInvalidated")
+
+    OnDestroy { [weak self] in
+      guard let self else { return }
+      DispatchQueue.main.async {
+        self.passwordSyncDestroyed = true
+        self.passwordSync?.revoke()
+      }
+    }
 
     AsyncFunction("folderInfo") { (path: String?) -> [String: Any] in
       let url = path.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? Self.defaultFolder
@@ -45,6 +54,7 @@ public class SyncModule: Module {
       let entropy = RecoveryPhrase.generateEntropy()
       guard Self.keyStore.save(entropy, account: account) else { return false }
       self.state.set(entropy)
+      self.revokePasswordAuthorizationAfterKeyChange()
       return true
     }.runOnQueue(Self.work)
 
@@ -65,18 +75,21 @@ public class SyncModule: Module {
       }
       guard Self.keyStore.save(entropy, account: account) else { return ["error": "keychain"] }
       self.state.set(entropy)
+      self.revokePasswordAuthorizationAfterKeyChange()
       return ["ok": true]
     }.runOnQueue(Self.work)
 
     AsyncFunction("unlock") { (account: String) -> Bool in
       guard let entropy = Self.keyStore.load(account: account), entropy.count == 32 else { return false }
       self.state.set(entropy)
+      self.revokePasswordAuthorizationAfterKeyChange()
       return true
     }.runOnQueue(Self.work)
 
     AsyncFunction("forget") { (account: String) in
       Self.keyStore.delete(account: account)
       self.state.set(nil)
+      self.revokePasswordAuthorizationAfterKeyChange()
     }.runOnQueue(Self.work)
 
     AsyncFunction("chainStatus") { (folder: String) throws -> String in
@@ -92,13 +105,23 @@ public class SyncModule: Module {
     }.runOnQueue(Self.work)
 
     AsyncFunction("write") { (folder: String, scope: String, payload: String) throws -> String in
-      try self.vault(folder).write(scope: scope, payload: Data(payload.utf8))
+      let vault = try self.vault(folder)
+      let plain: Data
+      do { plain = try PasswordBridgePayloads(keys: vault.keys).write(scope: scope, payload: payload) }
+      catch { throw Exception(name: "syncData", description: "Couldn’t validate encrypted sync data.") }
+      return try vault.write(scope: scope, payload: plain)
     }.runOnQueue(Self.work)
 
     AsyncFunction("read") { (folder: String, scope: String, known: [String]) throws -> [String: Any] in
-      let listing = try self.vault(folder).read(scope: scope, skipping: Set(known))
+      let vault = try self.vault(folder)
+      let listing = vault.read(scope: scope, skipping: Set(known))
+      let files: [[String: String]]
+      do {
+        let payloads = PasswordBridgePayloads(keys: vault.keys)
+        files = try listing.files.map { ["id": $0.id, "payload": try payloads.read(scope: scope, payload: $0.payload)] }
+      } catch { throw Exception(name: "syncData", description: "Couldn’t validate encrypted sync data.") }
       return [
-        "files": listing.files.map { ["id": $0.id, "payload": String(decoding: $0.payload, as: UTF8.self)] },
+        "files": files,
         "pending": listing.pending,
         "damaged": listing.damaged.map { ["id": $0.id, "age": $0.age * 1000] },
         "present": listing.present,
@@ -115,13 +138,14 @@ public class SyncModule: Module {
 
     AsyncFunction("sealLocal") { (text: String) throws -> String in
       guard let keys = self.state.keys else { throw Exception(name: "locked", description: "Sync isn't set up on this Mac.") }
-      return try keys.seal(Data(text.utf8), scopeTag: "local", fileId: "state").base64EncodedString()
+      do { return try PasswordBridgePayloads(keys: keys).sealLocal(text) }
+      catch { throw Exception(name: "syncState", description: "Couldn’t validate local sync state. Your saved state was kept.") }
     }.runOnQueue(Self.work)
 
-    AsyncFunction("openLocal") { (sealed: String) -> String? in
-      guard let keys = self.state.keys, let data = Data(base64Encoded: sealed),
-            let plain = try? keys.open(data, scopeTag: "local", fileId: "state") else { return nil }
-      return String(decoding: plain, as: UTF8.self)
+    AsyncFunction("openLocal") { (sealed: String) throws -> String in
+      guard let keys = self.state.keys else { throw Exception(name: "locked", description: "Sync isn't set up on this Mac.") }
+      do { return try PasswordBridgePayloads(keys: keys).openLocal(sealed) }
+      catch { throw Exception(name: "syncState", description: "Couldn’t validate local sync state. Your saved state was kept.") }
     }.runOnQueue(Self.work)
 
     AsyncFunction("recoveryWords") { () throws -> [String] in try self.words() }.runOnQueue(Self.work)
@@ -183,29 +207,57 @@ public class SyncModule: Module {
       NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path, isDirectory: true)])
     }.runOnQueue(.main)
 
-    AsyncFunction("readPasswords") { (engineProfile: String) -> [[String: Any]]? in
-      do {
-        let key = ChromiumCrypto.deriveKey(secret: try Self.safeStorageSecret())
-        let result = try ChromiumSecrets.logins(profile: Self.profileDirectory(engineProfile), key: key)
-        if result.undecryptable > 0 {
-          NSLog("[sync] \(result.undecryptable) saved passwords didn't decrypt; not syncing passwords now")
-          return nil
-        }
-        return result.items.map { c in
-          ["origin": c.realm ?? c.url, "url": c.url, "username": c.username, "password": c.password, "created": c.created ?? 0]
-        }
-      } catch ImportError.notFound(_) {
-        return []
-      } catch {
-        NSLog("[sync] reading passwords: \(error)")
-        return nil
+    AsyncFunction("authorizePasswordSync") { (folder: String, profiles: [[String: String]], promise: Promise) -> Void in
+      Task { @MainActor in
+        guard !self.passwordSyncDestroyed else { return promise.resolve(false) }
+        promise.resolve(await self.passwordCoordinator().authorize(folder: folder, profiles: profiles))
       }
-    }.runOnQueue(Self.work)
+    }.runOnQueue(.main)
+
+    Function("revokePasswordSyncAuthorization") {
+      DispatchQueue.main.async { self.passwordSync?.revoke() }
+    }
+
+    AsyncFunction("passwordSyncAuthorized") { (folder: String, scope: String, engineProfile: String, promise: Promise) -> Void in
+      Task { @MainActor in
+        promise.resolve(!self.passwordSyncDestroyed && self.passwordSync?.status(folder: folder, scope: scope, profile: engineProfile) == true)
+      }
+    }.runOnQueue(.main)
+
+    AsyncFunction("readPasswordRecords") { (folder: String, scope: String, engineProfile: String, promise: Promise) -> Void in
+      Task { @MainActor in
+        guard !self.passwordSyncDestroyed, let sync = self.passwordSync else { return promise.resolve(nil) }
+        promise.resolve(await sync.read(folder: folder, scope: scope, profile: engineProfile))
+      }
+    }.runOnQueue(.main)
+
+    AsyncFunction("applyPasswordRecords") { (folder: String, scope: String, engineProfile: String, changes: [[String: Any]], promise: Promise) -> Void in
+      Task { @MainActor in
+        guard !self.passwordSyncDestroyed, let sync = self.passwordSync else { return promise.resolve(false) }
+        promise.resolve(await sync.apply(folder: folder, scope: scope, profile: engineProfile, changes: changes))
+      }
+    }.runOnQueue(.main)
   }
 
   private func vault(_ folder: String) throws -> SyncVault {
     guard let keys = state.keys else { throw Exception(name: "locked", description: "Sync isn't set up on this Mac.") }
     return SyncVault(folder: URL(fileURLWithPath: folder, isDirectory: true), keys: keys)
+  }
+
+  private func revokePasswordAuthorizationAfterKeyChange() {
+    DispatchQueue.main.async {
+      self.passwordSync?.revoke()
+    }
+  }
+
+  @MainActor
+  private func passwordCoordinator() -> PasswordSyncCoordinator {
+    if let passwordSync { return passwordSync }
+    let coordinator = PasswordSyncCoordinator(store: ChromePasswordSyncStore(), snapshot: { [weak self] in
+      self?.state.passwordSnapshot
+    }, onInvalidate: { [weak self] in self?.sendEvent("onPasswordSyncInvalidated", [:]) })
+    passwordSync = coordinator
+    return coordinator
   }
 
   private func words() throws -> [String] {
@@ -260,42 +312,27 @@ public class SyncModule: Module {
   }
 
   static let keyStore: SyncKeyStore = dataDirectory.map { FileKeyStore(directory: $0) } ?? KeychainKeyStore()
-
-  static func profileDirectory(_ engineProfile: String) -> URL {
-    let root = dataDirectory?.appendingPathComponent("Chromium", isDirectory: true)
-      ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-      .appendingPathComponent(Bundle.main.bundleIdentifier ?? "com.ardia.browser", isDirectory: true)
-      .appendingPathComponent("Chromium", isDirectory: true)
-    return root.appendingPathComponent(engineProfile.isEmpty ? "Default" : "Profile \(engineProfile)", isDirectory: true)
-  }
-
-  static func safeStorageSecret() throws -> Data {
-    if dataDirectory != nil || !isTeamSigned { return Data("mock_password".utf8) }
-    return try SafeStorageKeychain.secret(service: "Ardia Safe Storage", account: "Ardia")
-  }
-
-  static let isTeamSigned: Bool = {
-    var code: SecCode?
-    guard SecCodeCopySelf([], &code) == errSecSuccess, let code else { return false }
-    var staticCode: SecStaticCode?
-    guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode else { return false }
-    var info: CFDictionary?
-    guard SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess,
-          let dict = info as? [String: Any] else { return false }
-    return dict[kSecCodeInfoTeamIdentifier as String] != nil
-  }()
 }
 
 private final class KeyState {
   private let lock = NSLock()
   private var _entropy: Data?
   private var _keys: SyncKeys?
+  private var passwordKeyGeneration: UInt64 = 0
 
   func set(_ entropy: Data?) {
     lock.lock()
     defer { lock.unlock() }
     _entropy = entropy
     _keys = entropy.map(SyncKeys.init(entropy:))
+    passwordKeyGeneration &+= 1
+  }
+
+  var passwordSnapshot: PasswordSyncKeySnapshot? {
+    lock.lock()
+    defer { lock.unlock() }
+    guard let keys = _keys else { return nil }
+    return PasswordSyncKeySnapshot(keys: keys, generation: passwordKeyGeneration)
   }
 
   var entropy: Data? {

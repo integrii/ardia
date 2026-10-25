@@ -1,5 +1,5 @@
-import { addHistoryVisits, deleteHistoryUrls, deletePassword, savePassword } from "@ardia/ardiacore";
-import { assignPositions, canonical, SyncNative, type Adapter, type Extraction, type SavedLogin } from "@ardia/sync";
+import { addHistoryVisits, deleteHistoryUrls } from "@ardia/ardiacore";
+import { assignPositions, canonical, SyncNative, type Adapter, type Extraction } from "@ardia/sync";
 import { bookmarkUuidFor, ensureRoots, isBookmarkUuid } from "../store/bookmarks";
 import { MAX_HISTORY, MAX_VISIT_TIMES } from "../store/history";
 import { useBrowser, type BrowserState } from "../store/browser";
@@ -1110,72 +1110,85 @@ export function tileFoldersAdapter(profileId: string): Adapter {
   };
 }
 
-type PasswordValue = { o: string; u: string; p: string };
+export type PasswordValue = { version: 2; sealed: string; fingerprint: string };
+export type PasswordSyncRecord = { key: string; value: PasswordValue; created: number | null };
+export type PasswordSyncChange = { key: string; desired: PasswordValue | null; base: PasswordValue | null };
+export type PasswordSyncBridge = {
+  readPasswordRecords(folder: string, scope: string, engineProfile: string): Promise<PasswordSyncRecord[] | null>;
+  applyPasswordRecords(folder: string, scope: string, engineProfile: string, changes: PasswordSyncChange[]): Promise<boolean>;
+};
 const PASSWORD_READ_INTERVAL = 30_000;
 
 export function passwordsAdapter(
   profileId: string,
+  scope: string,
+  folder: string,
   forced: () => boolean,
-  readLogins: (engineProfile: string) => Promise<SavedLogin[] | null | undefined> = async (p) => SyncNative?.readPasswords(p),
+  bridge: PasswordSyncBridge | null = SyncNative,
 ): Adapter {
   let lastRead = 0;
-  let quietUntil = 0;
-  let created = new Map<string, number>();
+  let created = new Map<string, number | null>();
   const profile = () => engineProfile(profileId);
-  const keyOf = (origin: string, username: string) => `pw:${origin}\n${username}`;
-  const read = async () => {
-    const logins = await readLogins(profile());
-    if (!logins) return null;
-    const out = new Map<string, PasswordValue & { c: number }>();
-    for (const l of logins) {
-      const origin = originOf(l);
-      if (origin) out.set(keyOf(origin, l.username), { o: origin, u: l.username, p: l.password, c: l.created });
-    }
-    return out;
-  };
   return {
     prefix: "pw:",
-    extract: async () => {
+    protectApply: true,
+    extract: async (base, _queued, _now, _known, _remote, _stamp, provenance = {}) => {
       const now = Date.now();
-      if (now < quietUntil || (now - lastRead < PASSWORD_READ_INTERVAL && !forced())) return null;
-      const logins = await read();
-      if (!logins) return null;
+      if (now - lastRead < PASSWORD_READ_INTERVAL && !forced()) return null;
+      const records = await bridge?.readPasswordRecords(folder, scope, profile());
+      if (!records) return null;
+      const values = new Map<string, unknown>();
+      const dates = new Map<string, number | null>();
+      for (const record of records) {
+        if (!record.key.startsWith("pw:") || !passwordValue(record.value) || values.has(record.key)) return null;
+        if (record.created !== null && (typeof record.created !== "number" || !Number.isFinite(record.created))) return null;
+        const known = base(record.key);
+        values.set(record.key, passwordValue(known) && known.fingerprint === record.value.fingerprint ? known : record.value);
+        dates.set(record.value.fingerprint, record.created);
+      }
+      for (const [key, candidates] of Object.entries(provenance)) {
+        if (!key.startsWith("pw:")) continue;
+        const local = values.get(key);
+        const landed = candidates.some((candidate) => candidate === null ? local === undefined : passwordValue(candidate) && passwordValue(local) && local.fingerprint === candidate.fingerprint);
+        if (!landed) continue;
+        const known = base(key);
+        if (passwordValue(known)) values.set(key, known);
+        else values.delete(key);
+      }
       lastRead = now;
-      created = new Map([...logins].map(([k, v]) => [k, v.c]));
-      return { values: new Map([...logins].map(([k, { o, u, p }]) => [k, { o, u, p } satisfies PasswordValue])) };
+      created = dates;
+      return { values };
     },
-    editedAt: (v) => created.get(keyOf((v as PasswordValue).o, (v as PasswordValue).u)) || undefined,
-    apply: async (visible, changed, base) => {
-      const local = await read();
-      if (!local) return false;
-      let ok = true;
+    editedAt: (value) => passwordValue(value) ? created.get(value.fingerprint) ?? 0 : undefined,
+    apply: async (visible, changed, base, records) => {
+      const changes: PasswordSyncChange[] = [];
       for (const key of changed) {
-        const v = visible.get(key) as PasswordValue | undefined;
-        const have = local.get(key);
-        const known = base(key) as PasswordValue | undefined;
-        if (have && known?.p !== have.p) continue;
-        const [origin, username] = [key.slice(3, key.indexOf("\n")), key.slice(key.indexOf("\n") + 1)];
-        if (v) {
-          if (have?.p === v.p) continue;
-          if (have) ok = (await deletePassword(profile(), origin, username)) && ok;
-          ok = (await savePassword(profile(), v.o, v.u, v.p)) && ok;
-        } else if (have) {
-          ok = (await deletePassword(profile(), origin, username)) && ok;
-        }
+        const desired = visible.get(key) ?? null;
+        const known = base(key) ?? null;
+        if (!key.startsWith("pw:") || (desired !== null && !passwordValue(desired)) || (known !== null && !passwordValue(known))) return false;
+        changes.push({ key, desired, base: known });
       }
-      let settled = false;
-      for (let i = 0; i < 20 && !settled; i++) {
-        const now = await read();
-        settled = !!now && [...changed].every((k) => (visible.get(k) as PasswordValue | undefined)?.p === now.get(k)?.p);
-        if (!settled) await new Promise((r) => setTimeout(r, 250));
+      const local = await bridge?.readPasswordRecords(folder, scope, profile());
+      if (!local) return false;
+      const current = new Map<string, PasswordValue>();
+      for (const record of local) {
+        if (!record.key.startsWith("pw:") || !passwordValue(record.value) || current.has(record.key)) return false;
+        current.set(record.key, record.value);
       }
-      if (!settled) quietUntil = Date.now() + 30_000;
-      return ok;
+      for (const change of changes) {
+        const have = current.get(change.key) ?? null;
+        const candidates = records?.applyProvenance?.[change.key] ?? [];
+        if (candidates.some((candidate) => candidate === null ? have === null : passwordValue(candidate) && have?.fingerprint === candidate.fingerprint)) change.base = have;
+      }
+      const applied = await bridge?.applyPasswordRecords(folder, scope, profile(), changes);
+      if (applied !== true) lastRead = 0;
+      return applied === true;
     },
   };
 }
 
-function originOf(login: SavedLogin): string | null {
-  const realm = login.origin.replace(/\/$/, "");
-  return /^https?:\/\/[^/\s]+$/.test(realm) ? realm : null;
+function passwordValue(value: unknown): value is PasswordValue {
+  if (!value || typeof value !== "object") return false;
+  const v = value as Partial<PasswordValue>;
+  return Object.keys(v).sort().join(",") === "fingerprint,sealed,version" && v.version === 2 && typeof v.sealed === "string" && !!v.sealed && typeof v.fingerprint === "string" && !!v.fingerprint;
 }

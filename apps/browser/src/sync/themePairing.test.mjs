@@ -33,7 +33,12 @@ globalThis.acTestNativeModules = {
     remove: async (_folder, _scope, list) => list.forEach((id) => folder.delete(id)),
     sealLocal: async (text) => `sealed:${text}`,
     openLocal: async (sealed) => (sealed.startsWith("sealed:") ? sealed.slice(7) : null),
-    readPasswords: async () => null,
+    authorizePasswordSync: async () => false,
+    passwordSyncAuthorized: async () => false,
+    revokePasswordSyncAuthorization: () => {},
+    addListener: () => ({ remove() {} }),
+    readPasswordRecords: async () => null,
+    applyPasswordRecords: async () => false,
   },
 };
 

@@ -41,7 +41,8 @@ class Device {
     this.scopes = { app: emptyScope(), p: emptyScope() };
     this.clock = new Clock(id);
     stub.passwordStores.set(id, new Map());
-    this.passwords = adapters.passwordsAdapter("default", () => true, stub.readLogins);
+    stub.passwordSyncControls.delete(id);
+    this.passwords = adapters.passwordsAdapter("default", "p", "fixture", () => true, stub.passwordSyncBridge);
   }
   with(fn) {
     stub.current.device = this.id;
@@ -63,7 +64,7 @@ class Device {
         adapters: list,
         clock: this.clock,
         device: this.id,
-        options,
+        options: { persistState: async () => { this.persistedScopes = structuredClone(this.scopes); }, ...options },
       });
     try {
       const app = await run("app", [adapters.settingsAdapter]);
@@ -976,6 +977,254 @@ test("passwords: saved on one Mac, changed or deleted on another; the newer edit
   assert.equal((await a.sync()).published, 0);
 });
 
+test("passwords: bridge arguments and persisted sync state contain opaque values, and fresh nonces do not publish edits", async () => {
+  const folder = new Folder();
+  const a = new Device("devA", folder);
+  const b = new Device("devB", folder);
+  const calls = [];
+  stub.passwordSyncControls.set(a.id, { calls });
+  stub.passwordSyncControls.set(b.id, { calls });
+  await a.with(() => stub.savePassword("", "https://bank.example", "alice", "opaque-only-secret"));
+  await syncAll([a, b]);
+  const state = JSON.stringify([a.scopes, b.scopes, [...folder.files.values()], calls]);
+  assert.equal(state.includes("opaque-only-secret"), false);
+  assert.equal(state.includes('"password"'), false);
+  assert.ok(calls.some((call) => call.op === "apply" && call.folder === "fixture" && call.scope === "p" && call.profile === ""));
+  const key = "pw:https://bank.example\nalice";
+  const before = a.scopes.p.base[key];
+  assert.equal((await a.sync()).published, 0);
+  assert.equal((await b.sync()).published, 0);
+  assert.equal(a.scopes.p.base[key], before);
+});
+
+for (const olderCreated of [1000, 0, null]) {
+  test(`passwords: a joining credential created at ${olderCreated} never replaces a newer credential`, async () => {
+    const folder = new Folder();
+    const a = new Device("devA", folder);
+    const b = new Device("devB", folder);
+    const key = "pw:https://bank.example\nalice";
+    await a.with(() => stub.savePassword("", "https://bank.example", "alice", "newer-secret"));
+    await b.with(() => stub.savePassword("", "https://bank.example", "alice", "older-secret"));
+    stub.passwordStores.get(a.id).get(key.slice(3)).created = 2000;
+    stub.passwordStores.get(b.id).get(key.slice(3)).created = olderCreated;
+    stub.current.device = b.id;
+    const extraction = await b.passwords.extract(() => undefined);
+    assert.equal(b.passwords.editedAt(extraction.values.get(key)), olderCreated ?? 0);
+    await syncAll([a, b]);
+    assert.equal(stub.passwordStores.get(a.id).get(key.slice(3)).password, "newer-secret");
+    assert.equal(stub.passwordStores.get(b.id).get(key.slice(3)).password, "newer-secret");
+    assert.equal(parseInt(a.scopes.p.records[key].h.split(".")[0], 36), 2000);
+    assert.equal((await b.sync()).published, 0);
+  });
+}
+
+test("passwords: denied and unavailable reads never become empty snapshots or acknowledge incoming changes", async () => {
+  const folder = new Folder();
+  const a = new Device("devA", folder);
+  const b = new Device("devB", folder);
+  const key = "pw:https://bank.example\nalice";
+  await a.with(() => stub.savePassword("", "https://bank.example", "alice", "original-secret"));
+  await syncAll([a, b]);
+  const before = b.scopes.p.base[key];
+  stub.passwordSyncControls.set(b.id, { authorized: false });
+  await a.with(() => stub.savePassword("", "https://bank.example", "alice", "changed-secret"));
+  await a.sync();
+  assert.equal((await b.sync()).published, 0);
+  assert.equal(b.scopes.p.base[key], before);
+  assert.ok(b.scopes.p.unapplied.includes(key));
+  assert.equal(stub.passwordStores.get(b.id).get(key.slice(3)).password, "original-secret");
+  stub.passwordSyncControls.set(b.id, { unavailable: true });
+  assert.equal((await b.sync()).published, 0);
+  assert.equal(b.scopes.p.base[key], before);
+  stub.passwordSyncControls.delete(b.id);
+  await b.sync();
+  assert.equal(b.scopes.p.unapplied.includes(key), false);
+  assert.equal(stub.passwordStores.get(b.id).get(key.slice(3)).password, "changed-secret");
+});
+
+test("passwords: failed apply and unsettled changes remain pending and retry without publishing a partial apply", async () => {
+  const folder = new Folder();
+  const a = new Device("devA", folder);
+  const b = new Device("devB", folder);
+  const key = "pw:https://bank.example\nalice";
+  await a.with(() => stub.savePassword("", "https://bank.example", "alice", "before-secret"));
+  await syncAll([a, b]);
+  const before = b.scopes.p.base[key];
+  await a.with(() => stub.savePassword("", "https://bank.example", "alice", "after-secret"));
+  await a.sync();
+  stub.passwordSyncControls.set(b.id, { failApply: true });
+  await b.sync();
+  assert.equal(b.scopes.p.base[key], before);
+  assert.ok(b.scopes.p.unapplied.includes(key));
+  assert.equal(stub.passwordStores.get(b.id).get(key.slice(3)).password, "before-secret");
+  stub.passwordSyncControls.set(b.id, { unsettled: true });
+  await b.sync();
+  assert.equal(b.scopes.p.base[key], before);
+  assert.ok(b.scopes.p.unapplied.includes(key));
+  assert.equal(stub.passwordStores.get(b.id).get(key.slice(3)).password, "after-secret");
+  assert.equal((await b.sync()).published, 0);
+  assert.ok(b.scopes.p.unapplied.includes(key));
+  stub.passwordSyncControls.delete(b.id);
+  assert.equal((await b.sync()).published, 0);
+  assert.equal(b.scopes.p.unapplied.includes(key), false);
+  assert.equal((await b.sync()).published, 0);
+});
+
+test("passwords: a local edit during native apply stays local and is published on retry", async () => {
+  const folder = new Folder();
+  const a = new Device("devA", folder);
+  const b = new Device("devB", folder);
+  const key = "pw:https://bank.example\nalice";
+  await a.with(() => stub.savePassword("", "https://bank.example", "alice", "before-secret"));
+  await syncAll([a, b]);
+  await a.with(() => stub.savePassword("", "https://bank.example", "alice", "remote-secret"));
+  await a.sync();
+  stub.passwordSyncControls.set(b.id, { beforeApply: () => stub.savePassword("", "https://bank.example", "alice", "local-secret") });
+  await b.sync();
+  assert.ok(b.scopes.p.unapplied.includes(key));
+  assert.equal(stub.passwordStores.get(b.id).get(key.slice(3)).password, "local-secret");
+  stub.passwordSyncControls.delete(b.id);
+  await syncAll([b, a]);
+  assert.equal(stub.passwordStores.get(a.id).get(key.slice(3)).password, "local-secret");
+  assert.equal(b.scopes.p.unapplied.includes(key), false);
+});
+
+test("passwords: legacy plaintext or malformed native records cannot be sent through the adapter", async () => {
+  const key = "pw:https://bank.example\nalice";
+  const plain = { o: "https://bank.example", u: "alice", p: "rejected-secret" };
+  let calls = 0;
+  const adapter = adapters.passwordsAdapter("default", "p", "fixture", () => true, {
+    readPasswordRecords: async () => [{ key, value: plain, created: 1 }],
+    applyPasswordRecords: async () => (calls++, true),
+  });
+  assert.equal(await adapter.extract(() => undefined), null);
+  assert.equal(await adapter.apply(new Map([[key, plain]]), new Set([key]), () => undefined), false);
+  assert.equal(await adapter.apply(new Map(), new Set([key]), () => plain), false);
+  assert.equal(calls, 0);
+});
+
+for (const mode of ["restart after partial apply", "new target after partial apply", "crash before applied base is saved"]) {
+  test(`passwords: durable apply provenance preserves newer remote values across ${mode}`, async () => {
+    const folder = new Folder();
+    const a = new Device("devA", folder);
+    const b = new Device("devB", folder);
+    const key = "pw:https://bank.example\nalice";
+    const second = "pw:https://second.example\nalice";
+    const save = (device, origin, password) => device.with(() => stub.savePassword("", origin, "alice", password));
+    const password = (device, record = key) => stub.passwordStores.get(device.id).get(record.slice(3))?.password;
+    await save(a, "https://bank.example", "initial");
+    await save(a, "https://second.example", "initial-second");
+    await syncAll([a, b]);
+    await save(a, "https://bank.example", "remote-one");
+    await save(a, "https://second.example", "remote-second");
+    await a.sync();
+    let attempts = 0;
+    b.passwords = adapters.passwordsAdapter("default", "p", "fixture", () => true, {
+      ...stub.passwordSyncBridge,
+      applyPasswordRecords: async (folder, scope, profile, changes) => {
+        if (++attempts === 1 && mode !== "crash before applied base is saved") {
+          assert.equal(changes.length, 2);
+          assert.equal(await stub.passwordSyncBridge.applyPasswordRecords(folder, scope, profile, changes.filter((change) => change.key === key)), true);
+          return false;
+        }
+        return stub.passwordSyncBridge.applyPasswordRecords(folder, scope, profile, changes);
+      },
+    });
+    await b.sync();
+    assert.equal(password(b), "remote-one");
+    assert.ok(b.persistedScopes.p.applyProvenance[key].length);
+    assert.ok(b.persistedScopes.p.unapplied.includes(key));
+    const persisted = JSON.stringify(b.persistedScopes);
+    assert.equal(persisted.includes("remote-one"), false);
+    if (mode !== "new target after partial apply") {
+      b.scopes = JSON.parse(persisted);
+      b.passwords = adapters.passwordsAdapter("default", "p", "fixture", () => true, stub.passwordSyncBridge);
+    }
+    await save(a, "https://bank.example", "remote-two");
+    await a.sync();
+    if (mode === "new target after partial apply") stub.passwordSyncControls.set(b.id, { failApply: true });
+    assert.equal((await b.sync()).published, 0);
+    if (mode === "new target after partial apply") {
+      assert.equal(b.scopes.p.applyProvenance[key].length, 2);
+      assert.equal(password(b), "remote-one");
+      stub.passwordSyncControls.delete(b.id);
+    }
+    assert.equal((await b.sync()).published, 0);
+    await a.sync();
+    assert.equal(password(a), "remote-two");
+    assert.equal(password(b), "remote-two");
+    assert.equal(password(b, second), "remote-second");
+    assert.equal(b.scopes.p.unapplied.includes(key), false);
+    assert.equal(b.scopes.p.applyProvenance[key], undefined);
+  });
+}
+
+test("passwords: native mutations await durable provenance and missing persistence fails closed", async () => {
+  const folder = new Folder();
+  const a = new Device("devA", folder);
+  const b = new Device("devB", folder);
+  const key = "pw:https://bank.example\nalice";
+  await a.with(() => stub.savePassword("", "https://bank.example", "alice", "new-secret"));
+  await a.sync();
+  let mutations = 0;
+  b.passwords = adapters.passwordsAdapter("default", "p", "fixture", () => true, {
+    ...stub.passwordSyncBridge,
+    applyPasswordRecords: async (...args) => (mutations++, stub.passwordSyncBridge.applyPasswordRecords(...args)),
+  });
+  await b.sync("default", { persistState: undefined });
+  assert.equal(mutations, 0);
+  assert.ok(b.scopes.p.unapplied.includes(key));
+  const warn = console.warn;
+  try {
+    console.warn = () => {};
+    await b.sync("default", { persistState: async () => { throw new Error("fixture-save-failure"); } });
+  } finally {
+    console.warn = warn;
+  }
+  assert.equal(mutations, 0);
+  assert.equal(stub.passwordStores.get(b.id).has(key.slice(3)), false);
+  let entered;
+  let release;
+  const persisting = new Promise((resolve) => (entered = resolve));
+  const persisted = new Promise((resolve) => (release = resolve));
+  const cycle = b.sync("default", {
+    persistState: async () => {
+      assert.ok(b.scopes.p.applyProvenance[key].length);
+      assert.ok(b.scopes.p.unapplied.includes(key));
+      entered();
+      await persisted;
+    },
+  });
+  await persisting;
+  assert.equal(mutations, 0);
+  assert.equal(stub.passwordStores.get(b.id).has(key.slice(3)), false);
+  release();
+  await cycle;
+  assert.equal(mutations, 1);
+  assert.equal(stub.passwordStores.get(b.id).get(key.slice(3)).password, "new-secret");
+});
+
+test("passwords: a genuine local edit after a crashed partial apply is not hidden by provenance", async () => {
+  const folder = new Folder();
+  const a = new Device("devA", folder);
+  const b = new Device("devB", folder);
+  const key = "pw:https://bank.example\nalice";
+  await a.with(() => stub.savePassword("", "https://bank.example", "alice", "initial"));
+  await syncAll([a, b]);
+  await a.with(() => stub.savePassword("", "https://bank.example", "alice", "remote-one"));
+  await a.sync();
+  stub.passwordSyncControls.set(b.id, { unsettled: true });
+  await b.sync();
+  b.scopes = structuredClone(b.persistedScopes);
+  b.passwords = adapters.passwordsAdapter("default", "p", "fixture", () => true, stub.passwordSyncBridge);
+  stub.passwordSyncControls.delete(b.id);
+  await b.with(() => stub.savePassword("", "https://bank.example", "alice", "real-local-edit"));
+  await syncAll([b, a]);
+  assert.equal(stub.passwordStores.get(a.id).get(key.slice(3)).password, "real-local-edit");
+  assert.equal(stub.passwordStores.get(b.id).get(key.slice(3)).password, "real-local-edit");
+  assert.equal(b.scopes.p.applyProvenance[key], undefined);
+});
+
 test("history: two Macs settle on the union of their visits in Chrome, publish nothing more, and deletions reach Chrome", async () => {
   const folder = new Folder();
   const a = new Device("devA", folder);
@@ -1829,9 +2078,12 @@ test("a bookmark made while another adapter is still reading survives that sync"
   });
   await a.sync();
   let reads = 0;
-  b.passwords = adapters.passwordsAdapter("default", () => true, async () => {
-    if (++reads === 2) S().addBookmark({ profileId: "default", url: "https://second.example/", title: "Made during the sync" });
-    return stub.readLogins();
+  b.passwords = adapters.passwordsAdapter("default", "p", "fixture", () => true, {
+    ...stub.passwordSyncBridge,
+    readPasswordRecords: async (...args) => {
+      if (++reads === 2) S().addBookmark({ profileId: "default", url: "https://second.example/", title: "Made during the sync" });
+      return stub.passwordSyncBridge.readPasswordRecords(...args);
+    },
   });
   await b.sync();
   assert.equal(reads >= 2, true, "the password read ran after the bookmarks' catch-up");

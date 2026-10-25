@@ -19,7 +19,8 @@ Code:
   - `SyncVault.swift`: the folder, with file coordination and partial files.
   - `SyncKeyStore.swift`: Keychain.
   - `RecoveryKit.swift`: PDF, text sheet and QR code.
-- `packages/sync/ios/SyncModule.swift`: the Expo module (`ArdiaSync`). It also reads this app's saved passwords.
+- `packages/sync/ios/SyncModule.swift`: the Expo module (`ArdiaSync`) and protected sync payload boundaries.
+- `packages/sync/ios/PasswordSync*.swift` and `ChromePasswordSyncStore.swift`: authorized native password synchronization. Its storage-level conditional mutation remains blocked; see [`sync-password-draft.md`](sync-password-draft.md).
 - `packages/sync/src`: the merge, in TypeScript with no dependencies.
   - `scope.ts`: replica, logs, snapshots, compaction.
   - `hlc.ts`: hybrid logical clocks.
@@ -307,23 +308,34 @@ What Chrome Sync does for extensions, through our folder (`packages/sync/src/ext
 ### Passwords
 
 Saved passwords are Chrome's (its password manager).
-- **Reading.** Chrome's own API (`passwordsPrivate`) reveals a password only after device
-  authentication, so sync reads the profile's `Login Data` with the importer's reader
-  (`ChromiumSecrets`, `packages/import`). Chrome's key is its "Ardia Safe Storage" item, or
-  the mock keychain's where ArdiaCoreHost uses that (test instances, ad hoc builds). No Touch ID prompt is needed each cycle, and no
-  Chromium change.
-- **Writing.** Writes go through Chrome's API (`savePassword`, `deletePassword` in
-  `@ardia/ardiacore`), so Chrome's in-memory store and autofill see them at once. A changed
-  password is a delete plus an add: the update API needs the device check.
-- **Safety.**
-  - A read that finds any row it can't decrypt is skipped (a partial list would read as
-    deletions).
-  - After applying, sync waits until Chrome's store on disk shows the change before reading it
-    again.
-  - A login changed here but not read yet isn't overwritten.
-  - Turning sync off, or turning Passwords off, never removes a password. Only a password
-    deleted on another Mac is deleted here.
-- **Cadence.** Passwords are read at most every 30 s (and at once with Sync Now).
+
+The issue 241 changes in this checkout are **not ready to ship**: the current presenter-level
+expected-current check is not atomic with the database write. See
+[`sync-password-draft.md`](sync-password-draft.md) for the unresolved race and required engine tests.
+
+- **Consent.** New setups leave password sync off. Unlock Password Sync requests native device
+  authentication for the exact approved folder, chain, profiles and scopes. Saved preferences
+  never grant access. Lock, sleep, key changes, disabling sync and configuration changes revoke
+  access; the maximum grant lifetime is 24 hours. Recovery disclosure is unchanged by this draft.
+- **Reading.** Native code uses typed Chrome services instead of independently decrypting
+  `Login Data`. The raw `readPasswords` bridge is removed. JavaScript receives native-sealed
+  records and keyed fingerprints, not plaintext credentials. Generic remote and local-state
+  readers also convert legacy password values before crossing that boundary.
+- **Merge.** Existing TypeScript merge logic retains opaque password records and causal metadata.
+  Native envelopes authenticate chain, scope and exact record identity. Randomized ciphertext
+  is not a change detector: stable authenticated fingerprints are. Creation dates survive the
+  typed bridge; an unknown initial date must not make an old joining credential win as new.
+- **Apply recovery.** Candidate apply results and unapplied keys are persisted before native
+  mutation. Earlier candidates survive changed retry targets and restarts. The checkpoint
+  includes the observed clock; startup recovers its lower bound from persisted records and
+  journals. Failed checkpoints prevent mutation and keep password status paused.
+- **Writing limitation.** Existing credentials are edited, not deleted and re-added. The current
+  presenter comparison can still miss a queued or not-yet-notified local change. A transactional
+  conditional mutation in Chromium's password backend is required before promising that local
+  edits cannot be overwritten. Settling the presenter is not proof of disk durability.
+- **Cadence.** Authorized passwords are read at most every 30 seconds, or with Sync Now.
+  Denied or unavailable reads are not empty stores. Disabling password sync does not delete
+  local passwords. A framework without the new native endpoints fails closed.
 
 ## UX (from Dia's binary)
 

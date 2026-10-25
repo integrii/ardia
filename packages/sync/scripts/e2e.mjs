@@ -8,18 +8,26 @@ import { fileURLToPath } from "node:url";
 import { freePort, launch, reporter, sleep } from "../../../scripts/lib/instance.mjs";
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
-const APP = path.resolve(process.argv[2] ?? `${repo}/apps/browser/build-sync/Build/Products/Debug/Ardia.app`);
-const WORK = path.resolve(process.argv[3] ?? `${process.env.TMPDIR ?? "/tmp"}/ac-sync-e2e`);
+const args = process.argv.slice(2);
+const MODE = args.find((arg) => arg.startsWith("--")) ?? "--full";
+const positions = args.filter((arg) => !arg.startsWith("--"));
+if (!["--full", "--non-passwords", "--denial"].includes(MODE) || args.filter((arg) => arg.startsWith("--")).length > 1 || positions.length > 2)
+  throw new Error("Usage: node packages/sync/scripts/e2e.mjs [app] [new-scratch-directory] [--full|--non-passwords|--denial]");
+const PASSWORDS = MODE === "--full";
+const APP = path.resolve(positions[0] ?? `${repo}/apps/browser/build-sync/Build/Products/Debug/Ardia.app`);
+const WORK = path.resolve(positions[1] ?? `${process.env.TMPDIR ?? "/tmp"}/ac-sync-e2e-${crypto.randomUUID()}`);
 const FOLDER = `${WORK}/folder`;
 const PORT = await freePort();
 const W = `http://127.0.0.1:${PORT}`;
 const DEV = { A: {}, B: {}, C: {} };
 for (const [name, d] of Object.entries(DEV)) d.dir = `${WORK}/${name}`;
 
-fs.rmSync(WORK, { recursive: true, force: true });
-const report = reporter(`${WORK}/e2e.log`, { name: "sync e2e" });
+fs.mkdirSync(WORK, { mode: 0o700 });
+const report = reporter(`${WORK}/e2e.log`, { name: `sync e2e ${MODE}` });
 const note = report.log;
 const check = (name, ok, detail = "") => report.record(name, { error: ok ? null : detail || "the assertion failed" });
+const coverage = `Mode ${MODE}: ${PASSWORDS ? "password propagation requires explicit device-owner authorization; hidden apps cannot grant it" : MODE === "--denial" ? "authorization denial and continued non-password sync only; no password propagation coverage" : "non-password sync only; password propagation checks excluded"}`;
+report.say(coverage);
 
 const apps = {};
 async function start(name) {
@@ -30,18 +38,20 @@ async function start(name) {
     ready: { timeout: 120_000, test: "return !!globalThis.acSync && Object.keys(ac.store.getState().windows).length > 0" },
   }));
   note(`${name}: pid ${app.pid}, DevTools ${app.port}, log ${app.log}`);
+  if (PASSWORDS && await ev(name, "return acSync.useSync.getState().enabled")) await authorizePasswords(name);
 }
 
 const short = (x, n) => (x === undefined ? "undefined" : JSON.stringify(x).slice(0, n));
-async function ev(name, body, timeout = 90_000) {
-  const what = body.replace(/\s+/g, " ").trim().slice(0, 160);
+async function ev(name, body, timeout = 90_000, sensitiveLabel = null) {
+  const what = sensitiveLabel ?? body.replace(/\s+/g, " ").trim().slice(0, 160);
   try {
     const result = await apps[name].eval(body, { timeout });
-    note(`[${name}] ${what} -> ${short(result, 1000)}`);
+    note(`[${name}] ${what} -> ${sensitiveLabel ? "completed (result redacted)" : short(result, 1000)}`);
     return result;
   } catch (e) {
-    note(`[${name}] ${what} -> error ${e.message}`);
-    throw new Error(`${name}: ${e.message}`);
+    const detail = sensitiveLabel ? `${sensitiveLabel} failed; sensitive request and result withheld` : e.message;
+    note(`[${name}] ${what} -> error ${detail}`);
+    throw new Error(`${name}: ${detail}`);
   }
 }
 
@@ -86,7 +96,9 @@ async function state(name) {
     const b = s.bookmarks; const roots = b.roots.default;
     const walk = (id) => { const n = b.nodes[id]; return n.kind === "url" ? n.title + " " + n.url : { [n.title]: n.children.map(walk) }; };
     const u = acSync.useSync.getState();
-    return Promise.all([acSync.native.readPasswords(""), globalThis.expo.modules.ArdiaCEF.listPasswords("")]).then(([pw, list]) => ({
+    const passwords = ${PASSWORDS} && u.enabled ? await (async () => { ${passwordRecordsBody} })() : null;
+    const list = await globalThis.expo.modules.ArdiaCEF.listPasswords("");
+    return {
       status: u.status, error: u.error, enabled: u.enabled, pending: u.pending,
       bookmarks: [walk(roots.bar), walk(roots.other)],
       history: (s.history.default || []).map((h) => h.url).sort(),
@@ -95,19 +107,53 @@ async function state(name) {
       rows: Object.values(s.tabs).filter((t) => t.pinned && t.pinnedAsRow).map((t) => t.pinnedUrl || t.url).sort(),
       groups: Object.values(s.groups).filter((g) => g.pinned).map((g) => g.name + ": " + g.tabIds.map((id) => s.tabs[id].url).join(", ")).sort(),
       unloadedPins: Object.values(s.tabs).filter((t) => t.pinned && t.unloaded).length,
-      passwords: (pw || []).map((p) => p.origin + " " + p.username + "=" + p.password).sort(),
+      passwords,
       chromePasswords: ((list && list.passwords) || []).map((p) => p.origin + " " + p.username).sort(),
       devices: u.devices.map((d) => d.id),
       remoteTabs: (u.remoteTabs.default || []).map((d) => ({ id: d.deviceId, urls: d.tabs.map((t) => t.url) })),
       menu: acSync.menu.syncedDevicesMenuItem("default"),
       deviceId: acSync.doc().deviceId,
-    }));
+    };
   `,
   );
 }
-const data = (x) => ({ bookmarks: x.bookmarks, history: x.history, settings: x.settings, pinned: x.pinned, rows: x.rows, groups: x.groups, passwords: x.passwords });
-const same = (a, b) => JSON.stringify(data(a)) === JSON.stringify(data(b));
+const data = (x, passwords = PASSWORDS) => ({ bookmarks: x.bookmarks, history: x.history, settings: x.settings, pinned: x.pinned, rows: x.rows, groups: x.groups, ...(passwords ? { passwords: x.passwords } : {}) });
+const same = (a, b, passwords = PASSWORDS) => JSON.stringify(data(a, passwords)) === JSON.stringify(data(b, passwords));
 const text = (x) => JSON.stringify(x);
+
+const passwordBindingBody = `
+  const doc = acSync.doc();
+  const link = doc.profiles.default;
+  if (!doc.enabled || !doc.folder || !link?.enabled || !/^[a-z2-7]{26}$/.test(link.syncId)) throw new Error("No enabled default-profile sync binding");
+  const scope = "p:" + link.syncId;
+  const engineProfile = "";
+`;
+const passwordRecordsBody = `
+  ${passwordBindingBody}
+  if (!await acSync.native.passwordSyncAuthorized(doc.folder, scope, engineProfile)) throw new Error("Password sync authorization is absent or expired; authorizePasswords() must succeed for this binding");
+  const records = await acSync.native.readPasswordRecords(doc.folder, scope, engineProfile);
+  if (!Array.isArray(records)) throw new Error("Authorized password record read failed; null is not an empty password store");
+  if (records.some((r) => typeof r.key !== "string" || !r.key.startsWith("pw:") || r.value?.version !== 2 || typeof r.value.sealed !== "string" || !/^[A-Za-z0-9+/]{43}=$/.test(r.value.fingerprint))) throw new Error("Invalid opaque password record");
+  if (new Set(records.map((r) => r.key)).size !== records.length) throw new Error("Duplicate password record keys");
+  return records.map((r) => ({ key: r.key, fingerprint: r.value.fingerprint })).sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+`;
+
+async function authorizePasswords(name) {
+  await ev(name, 'if (!acSync.useSync.getState().types.passwords) acSync.setTypeSynced("passwords", true); return acSync.syncNow()');
+  if (await ev(name, "return acSync.authorizePasswords()", 30_000) !== true)
+    throw new Error(`${name}: Password sync requires an explicit authorizePasswords() grant. ARDIA_BACKGROUND=1 refuses LocalAuthentication; this hidden full run cannot verify password propagation. Use --non-passwords for the non-password suite or --denial for denial coverage. A granted real-app run requires a separately authorized interactive test setup; no environment bypass is supported.`);
+}
+
+const passwordRecords = (name) => ev(name, passwordRecordsBody);
+const hasPassword = (state, expected) => state.passwords?.some((record) => record.key === expected.key && record.fingerprint === expected.fingerprint);
+
+async function capturePassword(name, origin, user) {
+  const key = `pw:${origin.replace(/\/$/, "")}\n${user}`;
+  const first = (await passwordRecords(name)).find((record) => record.key === key);
+  const second = (await passwordRecords(name)).find((record) => record.key === key);
+  if (!first || text(first) !== text(second)) throw new Error(`${name}: the known fixture is missing or its authenticated fingerprint is unstable`);
+  return first;
+}
 
 function bip39(entropy) {
   const list = fs.readFileSync(`${WORK}/english.txt`, "utf8").split("\n").filter(Boolean);
@@ -117,11 +163,53 @@ function bip39(entropy) {
 }
 
 const savePassword = (origin, user, password) =>
-  `const c = globalThis.expo.modules.ArdiaCEF; return c.deletePassword("", "${origin}", "${user}").then(() => c.savePassword("", "${origin}", "${user}", "${password}"));`;
+  `const c = globalThis.expo.modules.ArdiaCEF; return c.deletePassword("", ${JSON.stringify(origin)}, ${JSON.stringify(user)}).then(() => c.savePassword("", ${JSON.stringify(origin)}, ${JSON.stringify(user)}, ${JSON.stringify(password)}));`;
+
+async function seedPassword(name, origin, user, password) {
+  const saved = await ev(name, savePassword(origin, user, password), 30_000, "save synthetic password fixture");
+  if (saved?.ok !== true) throw new Error(`${name}: saving the synthetic password fixture failed`);
+}
+
+async function saveFixture(name, origin, user, password) {
+  if (!PASSWORDS) return null;
+  await seedPassword(name, origin, user, password);
+  return capturePassword(name, origin, user);
+}
+
+async function denialChecks() {
+  check("passwords default off", await ev("A", "return acSync.useSync.getState().types.passwords") === false);
+  await seedPassword("A", "https://nne2e-denied.example", "fixture", "ACE2E-denied-secret");
+  const before = await ev("A", 'return globalThis.expo.modules.ArdiaCEF.listPasswords("")');
+  if (!before?.passwords?.some((entry) => entry.origin.replace(/\/$/, "") === "https://nne2e-denied.example" && entry.username === "fixture"))
+    throw new Error("The denial fixture was not present in A's password manager");
+  const blocked = async () => ev("A", `${passwordBindingBody}
+    return {
+      authorized: await acSync.native.passwordSyncAuthorized(doc.folder, scope, engineProfile),
+      readDenied: await acSync.native.readPasswordRecords(doc.folder, scope, engineProfile) === null,
+      applied: await acSync.native.applyPasswordRecords(doc.folder, scope, engineProfile, [{ key: "pw:https://nne2e-denied.example\\nfixture", desired: null, base: null }]),
+    };`);
+  const initial = await blocked();
+  check("unapproved native password operations are denied", initial.authorized === false && initial.readDenied && initial.applied === false, text(initial));
+  await ev("A", 'acSync.setTypeSynced("passwords", true); return acSync.syncNow()');
+  check("hidden explicit password authorization is denied", await ev("A", "return acSync.authorizePasswords()", 30_000) === false);
+  const denied = await blocked();
+  check("denial leaves native reads and writes blocked", denied.authorized === false && denied.readDenied && denied.applied === false, text(denied));
+  check("password sync stays visibly paused", await ev("A", "return acSync.useSync.getState().passwordsPaused") === true);
+  check("denial keeps the local password listing", text(before) === text(await ev("A", 'return globalThis.expo.modules.ArdiaCEF.listPasswords("")')));
+  await ev("A", `ac.store.getState().addBookmark({ profileId: "default", url: "${W}/denied.html", title: "ACE2E bookmark after denial" }); return acSync.syncNow()`);
+  await ev("B", `return acSync.enterRecoveryPhrase(${JSON.stringify(FOLDER)}, ${JSON.stringify(fixturePhrase)})`, 30_000, "join synthetic sync fixture");
+  await sync("A", "B", "A", "B");
+  const b = await state("B");
+  check("bookmarks still sync after password authorization denial", text(b.bookmarks).includes("ACE2E bookmark after denial"));
+  check("the denied password never reaches B's password manager", !b.chromePasswords.some((entry) => entry.includes("nne2e-denied.example")));
+  check("no password record was published after denial", await ev("A", 'return !Object.values(acSync.doc().scopes).some((scope) => Object.keys(scope.records).some((key) => key.startsWith("pw:")))'));
+}
 
 fs.mkdirSync(FOLDER, { recursive: true });
 const swift = fs.readFileSync(`${repo}/packages/sync/ios/Core/Wordlist.swift`, "utf8");
 fs.writeFileSync(`${WORK}/english.txt`, [...swift.matchAll(/"([a-z]+)"/g)].map((m) => m[1]).join("\n"));
+const fixtureEntropy = crypto.randomBytes(32);
+const fixturePhrase = bip39(fixtureEntropy);
 
 const server = http
   .createServer((req, res) => {
@@ -137,8 +225,45 @@ try {
   const notStarted = started.find((r) => r.status === "rejected");
   if (notStarted) throw notStarted.reason;
 
-  check("A turns on sync", text(await ev("A", `return acSync.turnOnSync(${JSON.stringify(FOLDER)})`)) === '{"ok":true}');
-  const phrase = (await ev("A", "return acSync.native.recoveryWords()")).join(" ");
+  if (PASSWORDS) {
+    const turnedOn = await ev("A", `return acSync.turnOnSync(${JSON.stringify(FOLDER)})`);
+    if (turnedOn?.ok !== true) throw new Error(`A could not turn on sync: ${text(turnedOn)}`);
+    check("A turns on sync", true);
+    check("passwords default off", await ev("A", "return acSync.useSync.getState().types.passwords") === false);
+    await authorizePasswords("A");
+  } else {
+    fs.writeFileSync(`${DEV.A.dir}/sync-key-e2e-fixture`, fixtureEntropy, { mode: 0o600, flag: "wx" });
+    const created = await ev("A", `
+      if (!await acSync.native.unlock("e2e-fixture")) throw new Error("Could not load the scratch fixture key");
+      try { await acSync.native.createChain(${JSON.stringify(FOLDER)}); }
+      finally { await acSync.native.forget("e2e-fixture"); }
+      return acSync.enterRecoveryPhrase(${JSON.stringify(FOLDER)}, ${JSON.stringify(fixturePhrase)});
+    `, 30_000, "create and join a new synthetic sync chain");
+    if (created?.ok !== true) throw new Error("A could not join the synthetic sync chain");
+    await sync("A");
+  }
+  if (MODE === "--denial") {
+    await denialChecks();
+  } else {
+    await propagationChecks();
+  }
+} catch (error) {
+  check("the run finished", false, error.stack);
+} finally {
+  await Promise.all(Object.values(apps).map((app) => app.quit().catch((e) => note(`quit ${app.pid}: ${e.message}`))));
+  server.closeAllConnections();
+  server.close();
+  report.say(coverage);
+  process.exitCode = report.summary() ? 0 : 1;
+}
+
+async function propagationChecks() {
+  let phrase = fixturePhrase;
+  if (PASSWORDS) {
+    const words = await ev("A", "return acSync.native.recoveryWords()", 30_000, "read synthetic recovery words");
+    if (!Array.isArray(words) || words.length !== 24) throw new Error("Synthetic recovery phrase is unavailable");
+    phrase = words.join(" ");
+  }
   check("the phrase is 24 words", phrase.split(" ").length === 24);
   await ev(
     "A",
@@ -154,7 +279,7 @@ try {
     return true;`,
   );
   await visit("A", `${W}/visited.html?nne2e=hist1`);
-  await ev("A", savePassword("https://nne2e-bank.example", "nne2e-alice", "ACE2E-hunter2-secret"));
+  const alice = await saveFixture("A", "https://nne2e-bank.example", "nne2e-alice", "ACE2E-hunter2-secret");
   await sync("A");
 
   const words = phrase.split(" ");
@@ -169,7 +294,7 @@ try {
     "23 words": [words.slice(0, 23).join(" "), "wordCount"],
   };
   for (const [name, [p, error]] of Object.entries(wrong)) {
-    const r = await ev("B", `return acSync.enterRecoveryPhrase(${JSON.stringify(FOLDER)}, ${JSON.stringify(p)})`);
+    const r = await ev("B", `return acSync.enterRecoveryPhrase(${JSON.stringify(FOLDER)}, ${JSON.stringify(p)})`, 30_000, "try invalid synthetic recovery phrase");
     const enabled = await ev("B", "return acSync.useSync.getState().enabled");
     check(`B rejects the wrong phrase: ${name}`, r.error === error && !enabled, text(r));
   }
@@ -182,14 +307,20 @@ try {
     s.newTab(ac.store.getState().windowOrder[0], { url: "${W}/openb.html?nne2e=tabB" });
     return true;`,
   );
-  await ev("B", savePassword("https://nne2e-shop.example", "nne2e-bob", "ACE2E-B-shop-pass"));
+  if (PASSWORDS) await seedPassword("B", "https://nne2e-shop.example", "nne2e-bob", "ACE2E-B-shop-pass");
   const typed = words.map((w, i) => `${i + 1}. ${w.toUpperCase()}`).join("\n");
-  check("B joins with the right phrase", text(await ev("B", `return acSync.enterRecoveryPhrase(${JSON.stringify(FOLDER)}, ${JSON.stringify(typed)})`)) === '{"ok":true}');
+  check("B joins with the right phrase", text(await ev("B", `return acSync.enterRecoveryPhrase(${JSON.stringify(FOLDER)}, ${JSON.stringify(typed)})`, 30_000, "join with synthetic recovery phrase")) === '{"ok":true}');
+  if (PASSWORDS) await authorizePasswords("B");
+  const bob = PASSWORDS ? await capturePassword("B", "https://nne2e-shop.example", "nne2e-bob") : null;
   for (let i = 0; i < 3; i++) await sync("B", "A");
   let [a, b] = [await state("A"), await state("B")];
-  check("A's bookmarks, history, pinned tab and password reach B", text(b).includes("ACE2E Bookmark Alpha") && b.history.some((u) => u.includes("hist1")) && b.pinned.some((u) => u.includes("pin1")) && b.passwords.some((p) => p.includes("ACE2E-hunter2-secret")), text(data(b)));
-  check("B's own bookmark and password reach A (joining merges, nothing is lost)", text(a).includes("Gamma from B") && a.passwords.some((p) => p.includes("ACE2E-B-shop-pass")));
-  check("Chrome's password manager on B lists A's login", b.chromePasswords.includes("https://nne2e-bank.example nne2e-alice"));
+  check("A's bookmarks, history and pinned tab reach B", text(b).includes("ACE2E Bookmark Alpha") && b.history.some((u) => u.includes("hist1")) && b.pinned.some((u) => u.includes("pin1")), text(data(b)));
+  check("B's own bookmark reaches A (joining merges, nothing is lost)", text(a).includes("Gamma from B"));
+  if (PASSWORDS) {
+    check("A's authenticated password fixture reaches B", hasPassword(b, alice));
+    check("B's pre-join password fixture reaches A", hasPassword(a, bob));
+    check("Chrome's password manager on B lists A's login", b.chromePasswords.includes("https://nne2e-bank.example nne2e-alice"));
+  }
   check("B took the synced settings when it joined", b.settings.appearance === "dark" && b.settings.searchEngine === "duckduckgo", text(b.settings));
   check("synced pinned tabs arrive unloaded", b.unloadedPins === 1);
   check("A and B converge", same(a, b), text({ a: data(a), b: data(b) }));
@@ -206,16 +337,17 @@ try {
     s.addBookmark({ profileId: "default", url: "${W}/delta.html?nne2e=bmD", title: "ACE2E Bookmark Delta from B" });
     s.removeHistory("default", ["${W}/visited.html?nne2e=hist1"]);
     s.updateSettings({ showFullUrl: true, cleanUpInactiveTabsAfterHours: 24 });
-    return globalThis.expo.modules.ArdiaCEF.deletePassword("", "https://nne2e-shop.example", "nne2e-bob");`,
+    return ${PASSWORDS} ? globalThis.expo.modules.ArdiaCEF.deletePassword("", "https://nne2e-shop.example", "nne2e-bob") : true;`,
   );
   await visit("B", `${W}/visited2.html?nne2e=hist2`);
-  await ev("B", savePassword("https://nne2e-bank.example", "nne2e-alice", "ACE2E-changed-on-B"));
+  const changedAlice = await saveFixture("B", "https://nne2e-bank.example", "nne2e-alice", "ACE2E-changed-on-B");
+  if (PASSWORDS) check("a changed fixture has a different authenticated fingerprint", changedAlice.fingerprint !== alice.fingerprint);
   await sync("B", "A", "B", "A");
   a = await state("A");
   check("B's rename, delete and new bookmark reach A", text(a.bookmarks).includes("Beta Renamed on B") && !text(a.bookmarks).includes("Gamma from B") && text(a.bookmarks).includes("Delta from B"));
   check("B's history delete and new visit reach A", !a.history.some((u) => u.includes("hist1")) && a.history.some((u) => u.includes("hist2")));
   check("B's settings reach A", a.settings.showFullUrl === true && a.settings.cleanUp === 24);
-  check("B's password change and deletion reach A", text(a.passwords) === text(["https://nne2e-bank.example/ nne2e-alice=ACE2E-changed-on-B"]), text(a.passwords));
+  if (PASSWORDS) check("B's password change and deletion reach A", text(a.passwords) === text([changedAlice]), text(a.passwords));
 
   await ev(
     "A",
@@ -232,12 +364,12 @@ try {
     ac.store.getState().groupTabs([s.newTab(w, { url: "${W}/member.html?nne2e=grp1" })], { pinned: true, name: "ACE2E Pinned Group" });
     return true;`,
   );
-  await ev("A", savePassword("https://nne2e-mail.example", "nne2e-carol", "ACE2E-mail-from-A"));
+  const carol = await saveFixture("A", "https://nne2e-mail.example", "nne2e-carol", "ACE2E-mail-from-A");
   await sync("A", "B", "A", "B");
   b = await state("B");
   check("A's move, folder delete and new bookmark reach B", text(b.bookmarks).includes("ACE2E Second from A") && !text(b.bookmarks).includes("ACE2E Folder"), text(b.bookmarks));
   check("A's new pinned tab and settings reach B", b.pinned.some((u) => u.includes("pin2")) && b.settings.appearance === "light" && b.settings.cleanUp === null, text(b.settings));
-  check("A's new password reaches B", b.passwords.some((p) => p.includes("ACE2E-mail-from-A")));
+  if (PASSWORDS) check("A's new password reaches B", hasPassword(b, carol));
   check("A's new row arrives as a row and its tiles stay tiles", text(b.rows) === text([`${W}/row.html?nne2e=row1`]) && b.pinned.filter((u) => !b.rows.includes(u)).some((u) => u.includes("pin2")), text({ pinned: b.pinned, rows: b.rows }));
   check("A's pinned group arrives with its member", text(b.groups) === text([`ACE2E Pinned Group: ${W}/member.html?nne2e=grp1`]), text(b.groups));
 
@@ -247,14 +379,16 @@ try {
   check("A's unpinned tab leaves B's pinned tabs", !b.pinned.some((u) => u.includes("pin2")) && b.rows.length === 1 && b.groups.length === 1, text({ pinned: b.pinned, rows: b.rows, groups: b.groups }));
 
   await ev("A", `const s = ac.store.getState(); s.updateBookmark(Object.values(s.bookmarks.nodes).find((n) => n.title === "ACE2E Beta Renamed on B").id, { title: "ACE2E Concurrent A" }); s.updateSettings({ searchEngine: "bing" }); return true;`);
-  await ev("A", savePassword("https://nne2e-bank.example", "nne2e-alice", "ACE2E-concurrent-A"));
+  const concurrentA = await saveFixture("A", "https://nne2e-bank.example", "nne2e-alice", "ACE2E-concurrent-A");
   await sleep(20);
   await ev("B", `const s = ac.store.getState(); s.updateBookmark(Object.values(s.bookmarks.nodes).find((n) => n.title === "ACE2E Beta Renamed on B").id, { title: "ACE2E Concurrent B" }); s.updateSettings({ searchEngine: "google" }); return true;`);
-  await ev("B", savePassword("https://nne2e-bank.example", "nne2e-alice", "ACE2E-concurrent-B"));
+  const concurrentB = await saveFixture("B", "https://nne2e-bank.example", "nne2e-alice", "ACE2E-concurrent-B");
+  if (PASSWORDS) check("distinct concurrent fixtures have distinct authenticated fingerprints", concurrentA.fingerprint !== concurrentB.fingerprint);
   await sync("A", "B", "A", "B", "A", "B");
   [a, b] = [await state("A"), await state("B")];
   check("concurrent edits converge on both Macs", same(a, b), text({ a: data(a), b: data(b) }));
-  check("the later edit wins (bookmark, setting, password)", text(a.bookmarks).includes("ACE2E Concurrent B") && a.settings.searchEngine === "google" && a.passwords.some((p) => p.includes("ACE2E-concurrent-B")));
+  check("the later edit wins (bookmark and setting)", text(a.bookmarks).includes("ACE2E Concurrent B") && a.settings.searchEngine === "google");
+  if (PASSWORDS) check("the later password edit wins", hasPassword(a, concurrentB));
 
   check("the Extensions data type is on by default", (await ev("A", "return acSync.useSync.getState().types.extensions")) === true);
   await engine("A", "ac_extensions_sync_apply", { id: EXT, record: { on: true, inc: false, pin: false } });
@@ -328,7 +462,7 @@ try {
   check(`no plaintext in the sync folder (${files.filter((f) => f.endsWith(".nns")).length} files; ${needles.length} strings searched)`, leaks.length === 0, leaks.join(", "));
   check("every file is padded to 1 KiB steps", files.filter((f) => f.endsWith(".nns")).every((f) => (fs.statSync(f).size - 32) % 1024 === 0));
   const local = ["A", "B"].flatMap((n) => ["sync.json", "sync-state.nns", "sync-journal.nns"].map((f) => `${DEV[n].dir}/${f}`)).filter((f) => fs.existsSync(f));
-  check("this Mac's own sync state holds no plaintext password", local.every((f) => !fs.readFileSync(f).includes("ACE2E-concurrent-B")));
+  if (PASSWORDS) check("this Mac's own sync state holds no plaintext password", local.every((f) => !fs.readFileSync(f).includes("ACE2E-concurrent-B")));
 
   await apps.B.quit();
   delete apps.B;
@@ -354,7 +488,8 @@ try {
   await start("C");
   await ev("C", `ac.store.getState().newTab(ac.store.getState().windowOrder[0], { url: "${W}/openc.html?nne2e=tabC" }); return true`);
   await inHistory("C", `${W}/openc.html?nne2e=tabC`);
-  check("C joins", text(await ev("C", `return acSync.enterRecoveryPhrase(${JSON.stringify(FOLDER)}, ${JSON.stringify(phrase)})`)) === '{"ok":true}');
+  check("C joins", text(await ev("C", `return acSync.enterRecoveryPhrase(${JSON.stringify(FOLDER)}, ${JSON.stringify(phrase)})`, 30_000, "join with synthetic recovery phrase")) === '{"ok":true}');
+  if (PASSWORDS) await authorizePasswords("C");
   await sync("C", "C", "A", "B", "C");
   const c = await state("C");
   a = await state("A");
@@ -364,7 +499,7 @@ try {
   b = await state("B");
   await ev("B", "return acSync.stopSync({ deleteData: false })");
   const off = await state("B");
-  check("turning sync off on B leaves its bookmarks, history, settings, pinned tabs and passwords", same(b, off) && text(off.chromePasswords) === text(b.chromePasswords) && !off.enabled);
+  check("turning sync off on B leaves its non-password data and password listing", same(b, off, false) && text(off.chromePasswords) === text(b.chromePasswords) && !off.enabled);
   check("B's key is gone from its data folder", !fs.readdirSync(DEV.B.dir).some((f) => f.startsWith("sync-key-")));
   await sync("A");
   a = await state("A");
@@ -380,11 +515,6 @@ try {
   const cAfter = await state("C");
   check("A's Delete My Sync Data empties the folder", execSync(`find ${FOLDER} -mindepth 1 | wc -l`).toString().trim() === "0");
   check("C shows Dia's reset message and stops", cAfter.status === "reset" && /reset from another device/.test(cAfter.error ?? "") && !cAfter.enabled, text(cAfter.status));
-  check("A and C keep all their data", same(a, await state("A")) && same(cBefore, cAfter));
-} catch (error) {
-  check("the run finished", false, error.stack);
-} finally {
-  await Promise.all(Object.values(apps).map((app) => app.quit().catch((e) => note(`quit ${app.pid}: ${e.message}`))));
-  server.close();
-  process.exitCode = report.summary() ? 0 : 1;
+  const aOff = await state("A");
+  check("A and C keep non-password data and password listings after reset", same(a, aOff, false) && same(cBefore, cAfter, false) && text(a.chromePasswords) === text(aOff.chromePasswords) && text(cBefore.chromePasswords) === text(cAfter.chromePasswords));
 }

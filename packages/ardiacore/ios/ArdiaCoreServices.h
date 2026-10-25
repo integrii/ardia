@@ -27,6 +27,13 @@ typedef void (^ArdiaCoreResult)(NSDictionary<NSString *, id> *result);
     NS_SWIFT_NAME(allowSaving(profile:origin:completion:));
 + (void)exportPasswords:(NSString *)profile path:(nullable NSString *)path completion:(ArdiaCoreResult)completion
     NS_SWIFT_NAME(exportPasswords(profile:path:completion:));
++ (void)passwordsForSync:(NSString *)profile authorized:(BOOL (^)(void))authorized
+            completion:(void (^)(NSArray<NSDictionary<NSString *, id> *> *_Nullable logins))completion
+    NS_SWIFT_NAME(passwordsForSync(profile:authorized:completion:));
++ (void)compareAndSetPasswordForSync:(NSString *)profile origin:(NSString *)origin username:(NSString *)username
+                  expectedPassword:(nullable NSString *)expectedPassword desiredPassword:(nullable NSString *)desiredPassword
+                        authorized:(BOOL (^)(void))authorized completion:(void (^)(BOOL success))completion
+    NS_SWIFT_NAME(compareAndSetPasswordForSync(profile:origin:username:expectedPassword:desiredPassword:authorized:completion:));
 
 + (BOOL)boolPreference:(NSString *)name profile:(NSString *)profile NS_SWIFT_NAME(boolPreference(_:profile:));
 + (void)setBoolPreference:(NSString *)name value:(BOOL)value profile:(NSString *)profile NS_SWIFT_NAME(setBoolPreference(_:value:profile:));

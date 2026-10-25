@@ -4,6 +4,8 @@
 
 #import <dlfcn.h>
 #include <stdlib.h>
+#include <memory>
+#include <cmath>
 
 #include "../../../engine/chromium/src/chrome/browser/ardia/public/ac_engine.h"
 
@@ -15,6 +17,92 @@ NSMutableArray<NSArray *> *gPendingForwards;
 
 void *Symbol(const char *name) {
   return dlsym(RTLD_DEFAULT, name);
+}
+
+bool PasswordSyncSymbol(NSString *name) {
+  const char *symbol = name.UTF8String;
+  return symbol && (!strcmp(symbol, "ac_passwords_sync_read") || !strcmp(symbol, "ac_passwords_sync_compare_and_set"));
+}
+
+void WipeSecret(NSMutableData *secret) {
+  volatile unsigned char *bytes = (volatile unsigned char *)secret.mutableBytes;
+  for (NSUInteger i = 0; i < secret.length; i++) bytes[i] = 0;
+}
+
+struct PasswordSyncCall {
+  BOOL (^authorized)(void);
+  void (^completion)(BOOL, NSArray<NSDictionary<NSString *, id> *> *);
+  NSMutableArray<NSDictionary<NSString *, id> *> *rows = [NSMutableArray array];
+  NSMutableData *secret = nil;
+  bool finished = false;
+  bool valid = true;
+
+  bool Allowed() {
+    auto check = authorized;
+    return [NSThread isMainThread] && !finished && valid && check && check() && !finished && valid;
+  }
+
+  void Finish(bool success) {
+    if (finished) return;
+    success = success && Allowed();
+    finished = true;
+    auto done = completion;
+    NSArray<NSDictionary<NSString *, id> *> *result = success ? [rows copy] : nil;
+    WipeSecret(secret);
+    secret = nil;
+    rows = nil;
+    authorized = nil;
+    completion = nil;
+    if (done) done(success, result);
+  }
+};
+
+using PasswordSyncHolder = std::shared_ptr<PasswordSyncCall>;
+
+int PasswordSyncAuthorized(void *context) {
+  return (*static_cast<PasswordSyncHolder *>(context))->Allowed();
+}
+
+void PasswordSyncLogin(void *context, const ac_passwords_sync_login *login) {
+  auto request = *static_cast<PasswordSyncHolder *>(context);
+  if (!request->Allowed() || !login) return;
+  NSString *origin = [[NSString alloc] initWithBytes:login->origin length:login->origin_size encoding:NSUTF8StringEncoding];
+  NSString *username = [[NSString alloc] initWithBytes:login->username length:login->username_size encoding:NSUTF8StringEncoding];
+  NSString *password = [[NSString alloc] initWithBytes:login->password length:login->password_size encoding:NSUTF8StringEncoding];
+  if (!origin || !username || !password || (login->has_created && !std::isfinite(login->created_ms))) {
+    request->valid = false;
+    return;
+  }
+  [request->rows addObject:@{@"origin" : origin, @"username" : username, @"password" : password,
+                            @"created" : login->has_created ? @(login->created_ms) : NSNull.null}];
+}
+
+void PasswordSyncDone(void *context, int success) {
+  std::unique_ptr<PasswordSyncHolder> holder(static_cast<PasswordSyncHolder *>(context));
+  (*holder)->Finish(success != 0);
+}
+
+void StartPasswordSync(NSString *profile, PasswordSyncHolder request,
+                       ac_passwords_sync_read_t read,
+                       ac_passwords_sync_compare_and_set_t write) {
+  if (!request->Allowed() || ardiacore_host::IsIncognito(profile) || (!read && !write)) return request->Finish(false);
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+    request->Finish(false);
+  });
+  ardiacore_host::WithProfile(profile ?: @"", ^(ArdiaCoreProfile *p) {
+    if (!request->Allowed() || !p || !ArdiaCoreHost.isStarted || ([p respondsToSelector:@selector(offTheRecord)] && p.offTheRecord)) {
+      return request->Finish(false);
+    }
+    auto holder = new PasswordSyncHolder(request);
+    if (read) {
+      read(p.path.UTF8String, PasswordSyncAuthorized, PasswordSyncLogin, PasswordSyncDone, holder);
+    } else {
+      NSMutableData *secret = request->secret;
+      write(p.path.UTF8String, (const char *)secret.bytes, PasswordSyncAuthorized, PasswordSyncDone, holder);
+      WipeSecret(secret);
+      request->secret = nil;
+    }
+  });
 }
 
 NSString *JSON(id value) {
@@ -112,6 +200,7 @@ void InstallSink() {
 @implementation ArdiaCoreEngineBridge
 
 + (void)call:(NSString *)name profile:(NSString *)profile args:(NSString *)args completion:(void (^)(NSString *))completion {
+  if (PasswordSyncSymbol(name)) return completion(JSON(@{@"error" : @"native-only password sync endpoint"}));
   auto call = (ac_engine_call_t)Symbol(name.UTF8String);
   if (!call) return completion(JSON(@{@"error" : [NSString stringWithFormat:@"the engine has no %@", name]}));
   if (ardiacore_host::IsIncognito(profile)) {
@@ -148,6 +237,10 @@ void InstallSink() {
     volatile unsigned char *bytes = (volatile unsigned char *)secret.mutableBytes;
     for (NSUInteger i = 0; i < secret.length; i++) bytes[i] = 0;
   };
+  if (PasswordSyncSymbol(name)) {
+    wipe();
+    return completion(JSON(@{@"error" : @"native-only password sync endpoint"}));
+  }
   auto call = (ac_engine_call_t)Symbol(name.UTF8String);
   const char *bytes = (const char *)secret.bytes;
   if (!call || ardiacore_host::IsIncognito(profile) || !secret.length || bytes[secret.length - 1] != 0) {
@@ -171,6 +264,35 @@ void InstallSink() {
   InstallSink();
 }
 
++ (void)readPasswordsForSync:(NSString *)profile authorized:(BOOL (^)(void))authorized
+                completion:(void (^)(NSArray<NSDictionary<NSString *, id> *> *))completion {
+  if (![NSThread isMainThread]) {
+    dispatch_async(dispatch_get_main_queue(), ^{ [self readPasswordsForSync:profile authorized:authorized completion:completion]; });
+    return;
+  }
+  auto request = std::make_shared<PasswordSyncCall>();
+  request->authorized = [authorized copy];
+  request->completion = ^(BOOL success, NSArray<NSDictionary<NSString *, id> *> *rows) { completion(success ? rows : nil); };
+  auto read = reinterpret_cast<ac_passwords_sync_read_t>(Symbol("ac_passwords_sync_read"));
+  StartPasswordSync(profile, request, read, nullptr);
+}
+
++ (void)compareAndSetPasswordForSync:(NSString *)profile args:(NSMutableData *)args authorized:(BOOL (^)(void))authorized
+                        completion:(void (^)(BOOL))completion {
+  if (![NSThread isMainThread]) {
+    dispatch_async(dispatch_get_main_queue(), ^{ [self compareAndSetPasswordForSync:profile args:args authorized:authorized completion:completion]; });
+    return;
+  }
+  auto request = std::make_shared<PasswordSyncCall>();
+  request->authorized = [authorized copy];
+  request->completion = ^(BOOL success, NSArray<NSDictionary<NSString *, id> *> *) { completion(success); };
+  request->secret = args;
+  const char *bytes = (const char *)args.bytes;
+  if (!args.length || bytes[args.length - 1] != 0) return request->Finish(false);
+  auto write = reinterpret_cast<ac_passwords_sync_compare_and_set_t>(Symbol("ac_passwords_sync_compare_and_set"));
+  StartPasswordSync(profile, request, nullptr, write);
+}
+
 + (void)forwardTopics:(NSArray<NSString *> *)topics {
   gForwardedTopics = [NSSet setWithArray:topics];
 }
@@ -182,6 +304,7 @@ void InstallSink() {
 }
 
 + (BOOL)exports:(NSString *)name {
+  if (PasswordSyncSymbol(name)) return NO;
   return Symbol(name.UTF8String) != nullptr;
 }
 
