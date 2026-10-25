@@ -204,8 +204,7 @@ public class SyncModule: Module {
       self.recoveryOperation(promise) { words in
         let exports = try self.exports()
         let url = try exports.create(Self.kit(words, text: false))
-        self.clipboard().write(url as NSURL) { exports.remove(url) }
-        return true
+        return self.clipboard().write(url as NSURL) { exports.remove(url) }
       }
     }.runOnQueue(.main)
 
@@ -241,10 +240,9 @@ public class SyncModule: Module {
       }
     }.runOnQueue(.main)
 
-    AsyncFunction("copyRecoveryPhrase") { (promise: Promise) in
-      self.recoveryOperation(promise) { words in
+    AsyncFunction("copyRecoveryPhrase") { (endAuthorization: Bool?, promise: Promise) in
+      self.recoveryOperation(promise, endAuthorization: endAuthorization == true) { words in
         self.clipboard().write(words.joined(separator: " ") as NSString)
-        return true
       }
     }.runOnQueue(.main)
 
@@ -302,10 +300,16 @@ public class SyncModule: Module {
     }) { grant in completion(grant, binding) }
   }
 
-  private func recoveryOperation<T>(_ promise: Promise, operation: @escaping ([String]) throws -> T) {
+  private func recoveryOperation<T>(_ promise: Promise, endAuthorization: Bool = false, operation: @escaping ([String]) throws -> T) {
     authorizeRecovery { grant, binding in
       guard let grant, let binding,
             self.recoveryAuthorization?.validate(grant, binding: self.state.recoveryBinding) == true else { return promise.resolve(nil) }
+      defer {
+        if endAuthorization,
+           self.recoveryAuthorization?.validate(grant, binding: self.state.recoveryBinding) == true {
+          self.recoveryAuthorization?.revoke()
+        }
+      }
       do {
         let result = try self.state.withRecoveryEntropy(binding: binding) { entropy in
           try operation(RecoveryPhrase.words(for: entropy))

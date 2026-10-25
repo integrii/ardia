@@ -138,7 +138,14 @@ try {
   if (notStarted) throw notStarted.reason;
 
   check("A turns on sync", text(await ev("A", `return acSync.turnOnSync(${JSON.stringify(FOLDER)})`)) === '{"ok":true}');
-  const phrase = (await ev("A", "return acSync.native.recoveryWords()")).join(" ");
+  const deniedWords = await ev("A", "return acSync.native.recoveryWords()");
+  check("background recovery words require device-owner authorization", deniedWords === null);
+  if (deniedWords !== null) throw new Error("Background recovery words were disclosed without authorization");
+  const fixtureKeys = fs.readdirSync(DEV.A.dir).filter(name => name.startsWith("sync-key-"));
+  if (fixtureKeys.length !== 1) throw new Error("Expected one synthetic sync key in the freshly created A fixture");
+  const fixtureEntropy = fs.readFileSync(path.join(DEV.A.dir, fixtureKeys[0]));
+  if (fixtureEntropy.length !== 32) throw new Error("The synthetic sync fixture key must contain 32 bytes");
+  const phrase = bip39(fixtureEntropy);
   check("the phrase is 24 words", phrase.split(" ").length === 24);
   await ev(
     "A",

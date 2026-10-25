@@ -48,7 +48,7 @@ type SyncNative = {
   saveRecoveryKit(format: "pdf" | "text"): Promise<string | null>;
   copyRecoveryKit(): Promise<boolean | null>;
   shareRecoveryKit(): Promise<boolean | null>;
-  copyRecoveryPhrase(): Promise<boolean | null>;
+  copyRecoveryPhrase(endAuthorization?: boolean): Promise<boolean | null>;
   revealFolder(path: string): Promise<void>;
   readPasswords(engineProfile: string): Promise<SavedLogin[] | null>;
 };

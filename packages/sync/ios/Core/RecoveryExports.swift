@@ -14,7 +14,7 @@ final class RecoveryExports {
     self.lifetime = min(300, max(0, lifetime))
     root = base.appendingPathComponent(Self.directoryName, isDirectory: true)
     if mkdir(root.path, 0o700) != 0 && errno != EEXIST { throw Self.error() }
-    descriptor = open(root.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+    descriptor = open(root.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
     guard descriptor >= 0 else { throw Self.error() }
     var info = stat()
     guard fstat(descriptor, &info) == 0, info.st_uid == getuid(), info.st_mode & 0o777 == 0o700 else {
@@ -42,10 +42,10 @@ final class RecoveryExports {
   func create(_ data: Data) throws -> URL {
     let name = UUID().uuidString
     guard mkdirat(descriptor, name, 0o700) == 0 else { throw Self.error() }
-    let directory = openat(descriptor, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+    let directory = openat(descriptor, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
     guard directory >= 0 else { remove(name); throw Self.error() }
     defer { close(directory) }
-    let file = openat(directory, Self.fileName, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
+    let file = openat(directory, Self.fileName, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
     guard file >= 0 else { remove(name); throw Self.error() }
     defer { close(file) }
     do {
@@ -87,7 +87,7 @@ final class RecoveryExports {
     guard UUID(uuidString: name) != nil else { return }
     owned.remove(name)
     leases.removeValue(forKey: name)?.cancel()
-    let directory = openat(descriptor, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+    let directory = openat(descriptor, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
     guard directory >= 0 else { return }
     defer { close(directory) }
     var info = stat()
@@ -98,7 +98,7 @@ final class RecoveryExports {
 
   private static func cleanLegacy(base: URL) {
     let path = base.appendingPathComponent("Ardia Recovery Kit", isDirectory: true).path
-    let directory = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+    let directory = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
     guard directory >= 0 else { return }
     defer { close(directory) }
     var info = stat()

@@ -188,9 +188,10 @@ function SyncOn({ info }: { info: FolderInfo | null }) {
     if (choice === "kit") showRecoveryKit();
     else if (choice === "copy") {
       setRecoveryError(null);
-      try { await SyncNative?.copyRecoveryPhrase(); }
+      try {
+        if (!await SyncNative?.copyRecoveryPhrase(true)) setRecoveryError("Recovery phrase wasn’t copied. Unlock with Touch ID or your Mac password and try again.");
+      }
       catch { setRecoveryError("Couldn’t copy the recovery phrase. Please try again."); }
-      finally { SyncNative?.revokeRecoveryAuthorization(); }
     }
     else if (choice === "now") await syncNow();
     else if (choice === "reveal" && info) await SyncNative?.revealFolder(info.path);

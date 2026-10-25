@@ -101,8 +101,12 @@ final class DeviceOwnerAuthorization {
   func validate(_ candidate: Grant, binding: String?) -> Bool {
     dispatchPrecondition(condition: .onQueue(.main))
     guard candidate == grant, candidate.generation == generation else { return false }
-    guard candidate.binding == binding, now() < deadline else {
-      revoke()
+    guard candidate.binding == binding else {
+      revoke(.keyChanged)
+      return false
+    }
+    guard now() < deadline else {
+      revoke(.expired)
       return false
     }
     return true
@@ -110,6 +114,7 @@ final class DeviceOwnerAuthorization {
 
   func revoke(_ reason: Revocation = .session) {
     dispatchPrecondition(condition: .onQueue(.main))
+    let notify = grant != nil || pending || reason == .system || reason == .keyChanged
     generation &+= 1
     grant = nil
     pending = false
@@ -117,6 +122,6 @@ final class DeviceOwnerAuthorization {
     expiry?.cancel()
     expiry = nil
     authentication.cancel()
-    onInvalidate?(reason)
+    if notify { onInvalidate?(reason) }
   }
 }

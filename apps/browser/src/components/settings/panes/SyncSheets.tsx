@@ -301,7 +301,7 @@ function ConnectDeviceSheet() {
         left={
           access.unlocked ? <>
             <Button title={words ? "Hide Words" : "Show Words"} disabled={access.busy} onPress={() => (words ? setWords(null) : void access.run(async () => SyncNative?.recoveryWords(), setWords))} />
-            <Button title="Copy Words" disabled={access.busy} onPress={() => void access.run(async () => SyncNative?.copyRecoveryPhrase())} />
+            <Button title="Copy Words" disabled={access.busy} onPress={() => void access.run(async () => SyncNative?.copyRecoveryPhrase(false))} />
           </> : undefined
         }
       >
