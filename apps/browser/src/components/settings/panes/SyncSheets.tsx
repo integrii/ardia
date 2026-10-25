@@ -61,10 +61,11 @@ function useRecoveryAccess(clear: () => void) {
       SyncNative?.revokeRecoveryAuthorization();
     };
   }, []);
-  const run = async <T,>(action: (valid: () => boolean) => Promise<T | null | undefined>, accept?: (value: T) => void, authorize = false) => {
+  const run = async <T,>(action: (valid: () => boolean) => Promise<T | null | undefined>, accept?: (value: T) => void, authorize = false, failureMessage?: string | (() => string | undefined)) => {
     if (current.current.busy || (!authorize && !current.current.unlocked)) return;
     const generation = current.current.generation;
     const valid = () => current.current.alive && current.current.generation === generation;
+    const failure = () => typeof failureMessage === "function" ? failureMessage() : failureMessage;
     current.current.busy = true;
     setBusy(true);
     setError(null);
@@ -77,10 +78,15 @@ function useRecoveryAccess(clear: () => void) {
       }
       const result = await action(valid);
       if (!valid()) return;
-      if (result == null) invalidate();
+      const message = failure();
+      if (result == null) {
+        invalidate();
+        if (message) setError(message);
+      }
+      else if (result === false && message) setError(message);
       else accept?.(result);
     } catch {
-      if (valid()) setError("Couldn’t open the recovery kit. Please try again.");
+      if (valid()) setError(failure() ?? "Couldn’t open the recovery kit. Please try again.");
     } finally {
       if (valid()) {
         current.current.busy = false;
@@ -108,6 +114,7 @@ function RecoveryKitSheet() {
     return { path };
   }, ({ path }) => { if (path) setSaved(path); });
   const more = async () => {
+    let failureMessage: string | undefined;
     await access.run(async (valid) => {
       const choice = await showMenu([
         { id: "copy", title: "Copy", symbol: "doc.on.doc" },
@@ -116,11 +123,15 @@ function RecoveryKitSheet() {
         { id: "text", title: "Save as Text…", symbol: "doc.plaintext" },
       ]);
       if (!valid()) return null;
-      if (choice === "copy") return await SyncNative?.copyRecoveryKit() ? {} : null;
+      if (choice === "copy") {
+        failureMessage = "Recovery kit wasn’t copied. Please try again.";
+        const copied = await SyncNative?.copyRecoveryKit();
+        return copied === true ? {} : copied;
+      }
       if (choice === "share") return await SyncNative?.shareRecoveryKit() ? {} : null;
       if (choice === "text") return { path: await SyncNative?.saveRecoveryKit("text") };
       return {};
-    }, (result) => { if ("path" in result && result.path) setSaved(result.path); });
+    }, (result) => { if (typeof result === "object" && "path" in result && result.path) setSaved(result.path); }, false, () => failureMessage);
   };
   return (
     <Sheet width={460} onClose={access.close}>
@@ -301,7 +312,7 @@ function ConnectDeviceSheet() {
         left={
           access.unlocked ? <>
             <Button title={words ? "Hide Words" : "Show Words"} disabled={access.busy} onPress={() => (words ? setWords(null) : void access.run(async () => SyncNative?.recoveryWords(), setWords))} />
-            <Button title="Copy Words" disabled={access.busy} onPress={() => void access.run(async () => SyncNative?.copyRecoveryPhrase(false))} />
+            <Button title="Copy Words" disabled={access.busy} onPress={() => void access.run(async () => SyncNative?.copyRecoveryPhrase(false), undefined, false, "Recovery phrase wasn’t copied. Please try again.")} />
           </> : undefined
         }
       >

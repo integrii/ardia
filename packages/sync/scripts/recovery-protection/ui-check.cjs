@@ -4,6 +4,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 const crypto = require("node:crypto");
 const os = require("node:os");
+const childProcess = require("node:child_process");
 const root = path.resolve(__dirname, "../../../..");
 const ts = require(path.join(root, "node_modules/typescript"));
 const source = fs.readFileSync(path.join(root, "apps/browser/src/components/settings/panes/SyncSheets.tsx"), "utf8");
@@ -53,11 +54,43 @@ function setup() {
   vm.runInContext(compiled, context);
   const access = context.makeAccess(() => { clears++; rendered = null; });
   return {
-    access, auth, states, invalidate: () => invalidate(), cleanup: () => cleanup(),
+    access, auth, states, native: context.SyncNative, invalidate: () => invalidate(), cleanup: () => cleanup(),
     clears: () => clears, revocations: () => revocations, closed: () => closed,
     render: value => { rendered = value; }, rendered: () => rendered,
     queueAuth: () => { const next = deferred(); authorizations.push(next); return next; },
   };
+}
+
+function setupSheetCopy(test, component, title, response, choice = "copy") {
+  const sheet = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === component);
+  assert.ok(sheet);
+  let press;
+  const find = node => {
+    if (ts.isJsxSelfClosingElement(node) && node.tagName.getText(ast) === "Button") {
+      const attributes = node.attributes.properties;
+      const label = attributes.find(attribute => ts.isJsxAttribute(attribute) && attribute.name.getText(ast) === "title");
+      if (label?.initializer && ts.isStringLiteral(label.initializer) && label.initializer.text === title) {
+        press = attributes.find(attribute => ts.isJsxAttribute(attribute) && attribute.name.getText(ast) === "onPress")?.initializer?.expression;
+      }
+    }
+    ts.forEachChild(node, find);
+  };
+  find(sheet);
+  assert.ok(press, title + " retains its production button callback");
+  const more = sheet.body.statements.find(node => ts.isVariableStatement(node) && node.declarationList.declarations[0].name.getText(ast) === "more");
+  let pending;
+  const calls = [];
+  const copy = (...args) => { calls.push(args); return response(); };
+  test.native.copyRecoveryPhrase = copy;
+  test.native.copyRecoveryKit = copy;
+  const context = {
+    access: { ...test.access, run: (...args) => { pending = test.access.run(...args); return pending; } },
+    SyncNative: test.native, showMenu: async () => choice, setSaved: () => {},
+  };
+  vm.createContext(context);
+  const callback = (more ? more.getText(ast) + "\n" : "") + "globalThis.press = " + press.getText(ast) + ";";
+  vm.runInContext(ts.transpileModule(callback, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context);
+  return { calls, press: async () => { context.press(); assert.ok(pending); await pending; } };
 }
 
 const paneSource = fs.readFileSync(path.join(root, "apps/browser/src/components/settings/panes/Sync.tsx"), "utf8");
@@ -135,6 +168,67 @@ function checkNativeRecoveryBoundaries() {
   for (const open of opens) assert.ok(open.includes("O_CLOEXEC"), open);
   assert.match(native, /return self\.clipboard\(\)\.write\(url as NSURL\)/);
   assert.match(native, /endAuthorization: endAuthorization == true/);
+}
+
+function checkRunnerWithoutPython() {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "recovery-runner-node-"));
+  try {
+    const bin = path.join(scratch, "bin");
+    fs.mkdirSync(bin);
+    for (const command of ["dirname", "mkdir", "mktemp", "rm"]) {
+      const executable = childProcess.execFileSync("/usr/bin/which", [command], { encoding: "utf8" }).trim();
+      fs.symlinkSync(executable, path.join(bin, command));
+    }
+    const node = path.join(scratch, "configured-node");
+    fs.writeFileSync(node, '#!/bin/bash\nif [[ "${1:-}" == */ui-check.cjs ]]; then exit 0; fi\nexec ' + JSON.stringify(process.execPath) + ' "$@"\n', { mode: 0o700 });
+    const proof = path.join(scratch, "compiled-fixture");
+    const compiler = `#!${process.execPath}
+const fs = require("node:fs");
+const assert = require("node:assert/strict");
+const args = process.argv.slice(2);
+const source = fs.readFileSync(process.env.RECOVERY_TEST_SOURCE, "utf8");
+const start = source.indexOf("  private func recoveryOperation<");
+const end = source.indexOf("\\n  private func clipboard()", start);
+const expected = "import Foundation\\nextension RecoveryOperationFixture {\\n" + source.slice(start, end).replace("private func", "func") + "\\n}\\n";
+const fixture = args.find(value => value.endsWith("/RecoveryOperationFixture.swift"));
+assert.equal(fs.readFileSync(fixture, "utf8"), expected);
+fs.writeFileSync(process.env.RECOVERY_TEST_PROOF, expected);
+const output = args[args.indexOf("-o") + 1];
+fs.writeFileSync(output, "#!/bin/bash\\nexit 0\\n", { mode: 0o700 });
+`;
+    fs.writeFileSync(path.join(bin, "swiftc"), compiler, { mode: 0o700 });
+    const script = path.join(root, "packages/sync/scripts/recovery-protection.sh");
+    const native = path.join(root, "packages/sync/ios/SyncModule.swift");
+    const environment = { ...process.env, PATH: bin, NODE: node, RECOVERY_TEST_SOURCE: native, RECOVERY_TEST_PROOF: proof };
+    const run = runner => childProcess.spawnSync("/bin/bash", [runner, path.join(scratch, "caller")], { env: environment, encoding: "utf8", timeout: 20_000 });
+    const result = run(script);
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(fs.readFileSync(proof, "utf8").includes("func recoveryOperation<"));
+    assert.deepEqual(fs.readdirSync(path.join(scratch, "caller")), []);
+    const fakeRoot = path.join(scratch, "source-drift");
+    const fakeScript = path.join(fakeRoot, "packages/sync/scripts/recovery-protection.sh");
+    const fakeNative = path.join(fakeRoot, "packages/sync/ios/SyncModule.swift");
+    fs.mkdirSync(path.dirname(fakeScript), { recursive: true });
+    fs.mkdirSync(path.dirname(fakeNative), { recursive: true });
+    fs.copyFileSync(script, fakeScript);
+    const source = fs.readFileSync(native, "utf8");
+    for (const drift of [
+      source.replace("  private func recoveryOperation<", "  private func renamedRecoveryOperation<"),
+      source.replace("\n  private func clipboard()", "\n  private func renamedClipboard()"),
+      "\n  private func clipboard()\n  private func recoveryOperation<",
+      source + "\n  private func recoveryOperation<",
+    ]) {
+      fs.rmSync(proof);
+      fs.writeFileSync(fakeNative, drift);
+      const invalid = run(fakeScript);
+      assert.notEqual(invalid.status, 0);
+      assert.match(invalid.stderr, /unique bounded recoveryOperation fixture body/);
+      assert.equal(fs.existsSync(proof), false, "source drift fails before compilation");
+      fs.writeFileSync(proof, "reset");
+    }
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
 }
 (async () => {
   {
@@ -273,9 +367,51 @@ function checkNativeRecoveryBoundaries() {
     assert.deepEqual(test.errors, [null]);
     assert.deepEqual(test.arguments, [[true]]);
   }
-  console.log("PASS: 14 production recovery UI scenarios; success acceptance, independent newer sessions, dismissal clearing, copy denial and scoped cleanup");
+  for (const [component, title, label, args] of [
+    ["ConnectDeviceSheet", "Copy Words", "phrase", [false]],
+    ["RecoveryKitSheet", "Other Options", "kit", []],
+  ]) {
+    for (const result of [false, null, undefined, new Error("clipboard failed"), true]) {
+      const test = setup();
+      const unlock = test.access.run(async () => "unlocked mock", undefined, true);
+      test.auth.resolve(true);
+      await unlock;
+      const button = setupSheetCopy(test, component, title, () => result instanceof Error ? Promise.reject(result) : Promise.resolve(result));
+      await button.press();
+      assert.deepEqual(button.calls, [args]);
+      assert.equal(test.states[1], false);
+      if (result === true) assert.equal(test.states[2], null);
+      else assert.match(test.states[2], new RegExp("Recovery " + label + " wasn’t copied"));
+    }
+    const test = setup();
+    const unlock = test.access.run(async () => "unlocked mock", undefined, true);
+    test.auth.resolve(true);
+    await unlock;
+    const copy = deferred();
+    const button = setupSheetCopy(test, component, title, () => copy.promise);
+    const pending = button.press();
+    await new Promise(resolve => setImmediate(resolve));
+    test.invalidate();
+    copy.reject(new Error("late clipboard failure"));
+    await pending;
+    assert.equal(test.states[2], null);
+    assert.equal(test.states[0], false);
+  }
+  {
+    const test = setup();
+    const unlock = test.access.run(async () => "unlocked mock", undefined, true);
+    test.auth.resolve(true);
+    await unlock;
+    const button = setupSheetCopy(test, "RecoveryKitSheet", "Other Options", () => Promise.resolve(false), null);
+    await button.press();
+    assert.equal(button.calls.length, 0);
+    assert.equal(test.states[2], null);
+  }
+  console.log("PASS: 27 production recovery UI scenarios; action-specific copy feedback, actual sheet buttons, stale failures, success, dismissal and scoped cleanup");
   await checkRecoveryFixtureBootstrap();
   console.log("PASS: 4 production E2E bootstrap scenarios; denied words, synthetic fixture only, malformed and ambiguous fixture rejection");
   checkNativeRecoveryBoundaries();
   console.log("PASS: 7 native recovery authorization boundaries and all 5 close-on-exec open sites retained");
+  checkRunnerWithoutPython();
+  console.log("PASS: 5 runner scenarios; configured Node extracts actual Swift body without Python and rejects missing, reversed or ambiguous bounds");
 })().catch(error => { console.error(error); process.exitCode = 1; });
