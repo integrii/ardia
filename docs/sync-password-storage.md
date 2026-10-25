@@ -36,10 +36,42 @@ This is not a statement barrier. Staging must check the active guard before each
 SQL step, stop after the first failure, and never reuse ordinary multi-statement
 mutators. It also needs checked bindings and statement cleanup: ordinary void bind
 methods cannot certify success, and a failed SQLite binding can be followed by a
-successful execution using NULL instead of the requested value. The strict statement
-prerequisite, lossless reads, narrow staging and shared-store coordinator remain unfinished.
+successful execution using NULL instead of the requested value. Strict statement
+integration, lossless manager reads, narrow staging and the shared-store coordinator remain unfinished.
 Raw rollback/rebegin on the same connection is not detected by an active guard;
 the coordinator must exclude that reentrancy rather than claim it is safe.
+
+`engine/patches/chromium-password-sync-checked-statements.patch` follows the immediate
+transaction prerequisite and adds a separate, single-use `sql::CheckedStatement`.
+It observes actual bind return codes, latches failure, blocks execution after failure
+or missing bindings, and owns its noncached statement privately. Run refuses result
+columns before stepping; Step refuses non-readonly SQL before stepping and cannot
+restart after DONE. Typed copied readers keep NULL, empty values and access errors
+distinct, without storage-class coercion or borrowed output memory. Readonly status
+is not an arbitrary-SQL sandbox; manager schema and reentrancy restrictions still apply.
+
+Explicit Finish records reset, clear-bindings and finalize results separately. Every
+non-OK cleanup result conservatively poisons only the captured live connection,
+including a reset that repeats a prior step error. Callback-driven close/reopen cannot
+authorize cleanup of the new incarnation. Terminal results stay immutable; destructor
+cleanup is not a substitute for an explicitly checked completion before commit.
+Ordinary Statement/cache paths and existing test bodies are unchanged.
+
+The checked-statement follow-up has SHA-256
+`8b41e211a055a386d3c834f5c5acf05290ff266b6eb5077c84e8f5ef5cc6a7dc`.
+Independent six-file source review found no actionable defects. Main verified strict
+application, zero-fuzz/no-offset replay, source equality, whitespace, baseline/support
+hashes and preservation of all 14 existing Statement test bodies. Eleven pristine
+inputs were independently refetched from the exact tag; four modified SQL inputs
+were bound to the accepted immediate prerequisite.
+
+All 26 added real checked-statement gtest definitions are **uncompiled and unrun**.
+Bind/conversion OOM and VFS fault induction remain unverified. No independent real
+reset-only, clear-bindings-only or finalize-only failure inducer is established; those
+coverage gaps remain open despite conservative source handling. System SQLite probes
+do not execute Chromium CheckedStatement. The manager does not yet use this API;
+strict capability/schema/Unicode/Pickle policy, narrow staging, paired-store operation
+and actual native verification remain mandatory before enabling incoming writes.
 
 The separate SQL patch has SHA-256
 `879ca744208df22d61f55807025a8c458c14b5341b6cb589f96d5ca671ab8065`.
