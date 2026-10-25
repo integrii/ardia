@@ -158,6 +158,7 @@ function statusLine(status: SyncStatus, lastSyncedAt: number | null, pending: nu
 function SyncOn({ info }: { info: FolderInfo | null }) {
   const theme = useTheme();
   const colors = useFormColors();
+  const [recoveryError, setRecoveryError] = useState<string | null>(null);
   const status = useSync((s) => s.status);
   const lastSyncedAt = useSync((s) => s.lastSyncedAt);
   const pending = useSync((s) => s.pending);
@@ -185,7 +186,12 @@ function SyncOn({ info }: { info: FolderInfo | null }) {
       { id: "stop", title: "Stop Syncing…", symbol: "xmark.circle" },
     ]);
     if (choice === "kit") showRecoveryKit();
-    else if (choice === "copy") await SyncNative?.copyRecoveryPhrase();
+    else if (choice === "copy") {
+      setRecoveryError(null);
+      try { await SyncNative?.copyRecoveryPhrase(); }
+      catch { setRecoveryError("Couldn’t copy the recovery phrase. Please try again."); }
+      finally { SyncNative?.revokeRecoveryAuthorization(); }
+    }
     else if (choice === "now") await syncNow();
     else if (choice === "reveal" && info) await SyncNative?.revealFolder(info.path);
     else if (choice === "stop") showStopSync();
@@ -205,6 +211,7 @@ function SyncOn({ info }: { info: FolderInfo | null }) {
         </Row>
         <Row anchor="sync.folder" description={info ? folderLabel(info) : " "} />
       </Group>
+      {recoveryError ? <Text style={{ marginTop: 8, fontSize: 12, color: colors.destructive }}>{recoveryError}</Text> : null}
       {error && status !== "updated" ? (
         <View style={{ flexDirection: "row", gap: 6, marginTop: 8, paddingHorizontal: 2 }}>
           <Symbol name="exclamationmark.circle.fill" size={11} color={colors.destructive} style={{ width: 14, height: 15 }} />

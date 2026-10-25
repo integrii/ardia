@@ -6,9 +6,31 @@ import Security
 public class SyncModule: Module {
   private let state = KeyState()
   private static let work = DispatchQueue(label: "ardia.sync", qos: .utility)
+  private var recoveryAuthorization: DeviceOwnerAuthorization?
+  private var recoveryClipboard: RecoveryClipboard?
+  private var recoveryExports: RecoveryExports?
+  private var recoveryShares: [UUID: RecoveryShare] = [:]
+  private weak var recoverySavePanel: NSSavePanel?
+  private var recoveryDestroyed = false
 
   public func definition() -> ModuleDefinition {
     Name("ArdiaSync")
+    Events("onRecoveryInvalidated")
+
+    OnCreate {
+      DispatchQueue.main.async { self.recoveryExports = try? RecoveryExports() }
+    }
+
+    OnDestroy { [weak self] in
+      guard let self else { return }
+      DispatchQueue.main.async {
+        self.recoveryDestroyed = true
+        self.recoveryAuthorization?.revoke()
+        self.recoveryClipboard?.clear()
+        self.recoveryExports?.clear()
+        self.recoveryShares.removeAll()
+      }
+    }
 
     AsyncFunction("folderInfo") { (path: String?) -> [String: Any] in
       let url = path.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? Self.defaultFolder
@@ -45,6 +67,7 @@ public class SyncModule: Module {
       let entropy = RecoveryPhrase.generateEntropy()
       guard Self.keyStore.save(entropy, account: account) else { return false }
       self.state.set(entropy)
+      self.revokeRecoveryAuthorizationAfterKeyChange()
       return true
     }.runOnQueue(Self.work)
 
@@ -65,18 +88,21 @@ public class SyncModule: Module {
       }
       guard Self.keyStore.save(entropy, account: account) else { return ["error": "keychain"] }
       self.state.set(entropy)
+      self.revokeRecoveryAuthorizationAfterKeyChange()
       return ["ok": true]
     }.runOnQueue(Self.work)
 
     AsyncFunction("unlock") { (account: String) -> Bool in
       guard let entropy = Self.keyStore.load(account: account), entropy.count == 32 else { return false }
       self.state.set(entropy)
+      self.revokeRecoveryAuthorizationAfterKeyChange()
       return true
     }.runOnQueue(Self.work)
 
     AsyncFunction("forget") { (account: String) in
       Self.keyStore.delete(account: account)
       self.state.set(nil)
+      self.revokeRecoveryAuthorizationAfterKeyChange()
     }.runOnQueue(Self.work)
 
     AsyncFunction("chainStatus") { (folder: String) throws -> String in
@@ -124,59 +150,102 @@ public class SyncModule: Module {
       return String(decoding: plain, as: UTF8.self)
     }.runOnQueue(Self.work)
 
-    AsyncFunction("recoveryWords") { () throws -> [String] in try self.words() }.runOnQueue(Self.work)
+    AsyncFunction("authorizeRecovery") { (promise: Promise) in
+      self.authorizeRecovery { grant, _ in promise.resolve(grant != nil) }
+    }.runOnQueue(.main)
 
-    AsyncFunction("qrCode") { () throws -> String? in
-      guard let image = RecoveryKit.qrCode(words: try self.words()), let png = RecoveryKit.png(image) else { return nil }
-      return "data:image/png;base64," + png.base64EncodedString()
-    }.runOnQueue(Self.work)
+    Function("revokeRecoveryAuthorization") {
+      DispatchQueue.main.async { self.recoveryAuthorization?.revoke() }
+    }
 
-    AsyncFunction("recoveryKitPreview") { (width: Double) throws -> String? in
-      try self.preview(width: CGFloat(width))
+    AsyncFunction("recoveryWords") { (promise: Promise) in
+      self.recoveryOperation(promise) { $0 }
+    }.runOnQueue(.main)
+
+    AsyncFunction("qrCode") { (promise: Promise) in
+      self.recoveryOperation(promise) { words -> String? in
+        guard let image = RecoveryKit.qrCode(words: words), let png = RecoveryKit.png(image) else { return nil }
+        return "data:image/png;base64," + png.base64EncodedString()
+      }
+    }.runOnQueue(.main)
+
+    AsyncFunction("recoveryKitPreview") { (width: Double, promise: Promise) in
+      self.recoveryOperation(promise) { words in self.preview(words: words, width: CGFloat(width)) }
     }.runOnQueue(.main)
 
     AsyncFunction("saveRecoveryKit") { (format: String, promise: Promise) in
-      do {
-        let words = try self.words()
+      self.authorizeRecovery { grant, binding in
+        guard let grant, let binding, Self.environment["ARDIA_BACKGROUND"] != "1" else { return promise.resolve(nil) }
         let panel = NSSavePanel()
         let text = format == "text"
         panel.nameFieldStringValue = text ? RecoveryKit.textName : RecoveryKit.pdfName
         panel.allowedContentTypes = [text ? .plainText : .pdf]
+        panel.message = "This file contains your unencrypted recovery phrase. Anyone with it can read your synced data."
         panel.canCreateDirectories = true
+        self.recoverySavePanel = panel
         panel.begin { response in
-          guard response == .OK, let url = panel.url else { return promise.resolve(nil) }
+          if self.recoverySavePanel === panel { self.recoverySavePanel = nil }
+          guard response == .OK, let url = panel.url,
+                self.recoveryAuthorization?.validate(grant, binding: self.state.recoveryBinding) == true else { return promise.resolve(nil) }
           do {
-            try Self.kit(words, text: text).write(to: url, options: [.atomic])
-            promise.resolve(url.path)
+            let path = try self.state.withRecoveryEntropy(binding: binding) { entropy -> String in
+              try Self.kit(RecoveryPhrase.words(for: entropy), text: text).write(to: url, options: [.atomic])
+              return url.path
+            }
+            promise.resolve(path)
           } catch {
-            promise.reject("save", error.localizedDescription)
+            promise.reject("save", "Couldn’t save the recovery kit. Try unlocking it again.")
           }
         }
-      } catch {
-        promise.reject("locked", "Sync isn't set up on this Mac.")
       }
     }.runOnQueue(.main)
 
-    AsyncFunction("copyRecoveryKit") { () throws in
-      let url = try self.temporaryKit()
-      NSPasteboard.general.clearContents()
-      NSPasteboard.general.writeObjects([url as NSURL])
+    AsyncFunction("copyRecoveryKit") { (promise: Promise) in
+      self.recoveryOperation(promise) { words in
+        let exports = try self.exports()
+        let url = try exports.create(Self.kit(words, text: false))
+        self.clipboard().write(url as NSURL) { exports.remove(url) }
+        return true
+      }
     }.runOnQueue(.main)
 
-    AsyncFunction("shareRecoveryKit") { () throws in
-      let url = try self.temporaryKit()
-      guard let window = NSApp.keyWindow ?? NSApp.windows.first(where: \.isVisible), let view = window.contentView else { return }
-      let point = view.convert(window.mouseLocationOutsideOfEventStream, from: nil)
-      NSSharingServicePicker(items: [url]).show(relativeTo: NSRect(origin: point, size: .zero), of: view, preferredEdge: .minY)
+    AsyncFunction("shareRecoveryKit") { (promise: Promise) in
+      self.authorizeRecovery { grant, binding in
+        guard let grant, let binding,
+              self.recoveryAuthorization?.validate(grant, binding: self.state.recoveryBinding) == true,
+              Self.environment["ARDIA_BACKGROUND"] != "1",
+              let window = NSApp.keyWindow ?? NSApp.windows.first(where: \.isVisible), let view = window.contentView else { return promise.resolve(nil) }
+        do {
+          let exports = try self.exports()
+          let url = try self.state.withRecoveryEntropy(binding: binding) { entropy in
+            try exports.create(Self.kit(RecoveryPhrase.words(for: entropy), text: false))
+          }
+          let id = UUID()
+          let share = RecoveryShare(url: url, authorized: { [weak self] in
+            guard let self else { return false }
+            return self.recoveryAuthorization?.validate(grant, binding: self.state.recoveryBinding) == true
+          }) { [weak self] in
+            exports.remove(url)
+            self?.recoveryShares.removeValue(forKey: id)
+          }
+          self.recoveryShares[id] = share
+          DispatchQueue.main.asyncAfter(deadline: .now() + 300) { [weak self] in
+            self?.recoveryShares[id]?.cancelUnconsumed()
+            self?.recoveryShares.removeValue(forKey: id)
+          }
+          share.show(in: view, at: view.convert(window.mouseLocationOutsideOfEventStream, from: nil))
+          promise.resolve(true)
+        } catch {
+          promise.reject("recovery", "Couldn’t share the recovery kit. Try unlocking it again.")
+        }
+      }
     }.runOnQueue(.main)
 
-    AsyncFunction("copyRecoveryPhrase") { () throws in
-      let words = try self.words().joined(separator: " ")
-      let pasteboard = NSPasteboard.general
-      pasteboard.clearContents()
-      pasteboard.declareTypes([.string, NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType")], owner: nil)
-      pasteboard.setString(words, forType: .string)
-      pasteboard.setString("", forType: NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"))
+    AsyncFunction("copyRecoveryPhrase") { (promise: Promise) in
+      self.recoveryOperation(promise) { words in
+        self.clipboard().write(words.joined(separator: " ") as NSString)
+        return true
+      }
     }.runOnQueue(.main)
 
     AsyncFunction("revealFolder") { (path: String) in
@@ -208,9 +277,58 @@ public class SyncModule: Module {
     return SyncVault(folder: URL(fileURLWithPath: folder, isDirectory: true), keys: keys)
   }
 
-  private func words() throws -> [String] {
-    guard let entropy = state.entropy else { throw Exception(name: "locked", description: "Sync isn't set up on this Mac.") }
-    return RecoveryPhrase.words(for: entropy)
+  private func revokeRecoveryAuthorizationAfterKeyChange() {
+    DispatchQueue.main.async {
+      self.recoveryAuthorization?.revoke(.keyChanged)
+    }
+  }
+
+  private func authorizeRecovery(_ completion: @escaping (DeviceOwnerAuthorization.Grant?, String?) -> Void) {
+    guard !recoveryDestroyed else { return completion(nil, nil) }
+    if recoveryAuthorization == nil {
+      let authorization = DeviceOwnerAuthorization()
+      authorization.onInvalidate = { [weak self] reason in
+        guard let self else { return }
+        if reason == .system || reason == .keyChanged { self.recoveryClipboard?.clear() }
+        self.recoverySavePanel?.cancel(nil)
+        for share in Array(self.recoveryShares.values) { share.cancelUnconsumed() }
+        self.sendEvent("onRecoveryInvalidated", [:])
+      }
+      recoveryAuthorization = authorization
+    }
+    guard let binding = state.recoveryBinding else { return completion(nil, nil) }
+    recoveryAuthorization?.authorize(binding: binding, reason: "Unlock your Ardia recovery phrase.", currentBinding: { [weak self] in
+      self?.state.recoveryBinding
+    }) { grant in completion(grant, binding) }
+  }
+
+  private func recoveryOperation<T>(_ promise: Promise, operation: @escaping ([String]) throws -> T) {
+    authorizeRecovery { grant, binding in
+      guard let grant, let binding,
+            self.recoveryAuthorization?.validate(grant, binding: self.state.recoveryBinding) == true else { return promise.resolve(nil) }
+      do {
+        let result = try self.state.withRecoveryEntropy(binding: binding) { entropy in
+          try operation(RecoveryPhrase.words(for: entropy))
+        }
+        promise.resolve(result)
+      } catch {
+        promise.reject("recovery", "Couldn’t open the recovery kit. Try unlocking it again.")
+      }
+    }
+  }
+
+  private func clipboard() -> RecoveryClipboard {
+    if let recoveryClipboard { return recoveryClipboard }
+    let clipboard = RecoveryClipboard(pasteboard: .general)
+    recoveryClipboard = clipboard
+    return clipboard
+  }
+
+  private func exports() throws -> RecoveryExports {
+    if let recoveryExports { return recoveryExports }
+    let exports = try RecoveryExports()
+    recoveryExports = exports
+    return exports
   }
 
   private static func kit(_ words: [String], text: Bool) -> Data {
@@ -219,16 +337,9 @@ public class SyncModule: Module {
       : RecoveryKit.pdf(words: words, created: Date(), device: device)
   }
 
-  private func temporaryKit() throws -> URL {
-    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("Ardia Recovery Kit", isDirectory: true)
-    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-    let url = dir.appendingPathComponent(RecoveryKit.pdfName)
-    try Self.kit(try words(), text: false).write(to: url, options: [.atomic])
-    return url
-  }
-
-  private func preview(width: CGFloat) throws -> String? {
-    let pdf = Self.kit(try words(), text: false)
+  private func preview(words: [String], width: CGFloat) -> String? {
+    guard width.isFinite, width >= 1, width <= 2048 else { return nil }
+    let pdf = Self.kit(words, text: false)
     guard let page = NSImage(data: pdf) else { return nil }
     let scale = (NSScreen.main?.backingScaleFactor ?? 2)
     let size = NSSize(width: width, height: width * page.size.height / page.size.width)
@@ -290,12 +401,29 @@ private final class KeyState {
   private let lock = NSLock()
   private var _entropy: Data?
   private var _keys: SyncKeys?
+  private var recoveryGeneration: UInt64 = 0
 
   func set(_ entropy: Data?) {
     lock.lock()
     defer { lock.unlock() }
     _entropy = entropy
     _keys = entropy.map(SyncKeys.init(entropy:))
+    recoveryGeneration &+= 1
+  }
+
+  var recoveryBinding: String? {
+    lock.lock()
+    defer { lock.unlock() }
+    return _entropy == nil ? nil : String(recoveryGeneration)
+  }
+
+  func withRecoveryEntropy<T>(binding: String, operation: (Data) throws -> T) throws -> T {
+    lock.lock()
+    defer { lock.unlock() }
+    guard binding == String(recoveryGeneration), let entropy = _entropy else {
+      throw Exception(name: "locked", description: "Unlock your recovery kit again.")
+    }
+    return try operation(entropy)
   }
 
   var entropy: Data? {

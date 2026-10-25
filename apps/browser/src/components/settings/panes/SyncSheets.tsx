@@ -1,6 +1,6 @@
 import { showMenu, Symbol } from "@ardia/shell";
 import { SyncNative, type FolderInfo } from "@ardia/sync";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Image, StyleSheet, Text, TextInput, View } from "react-native";
 import { useTheme } from "../../../lib/theme";
 import { enterRecoveryPhrase, stopSync } from "../../../sync/engine";
@@ -33,29 +33,97 @@ export function showRecoveryKit() {
   showSettingsSheet(<RecoveryKitSheet />);
 }
 
+function useRecoveryAccess(clear: () => void) {
+  const current = useRef({ alive: true, generation: 0, unlocked: false, busy: false });
+  const clearRef = useRef(clear);
+  clearRef.current = clear;
+  const [unlocked, setUnlocked] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const invalidate = () => {
+    current.current.generation++;
+    current.current.unlocked = false;
+    current.current.busy = false;
+    if (!current.current.alive) return;
+    clearRef.current();
+    setUnlocked(false);
+    setBusy(false);
+    setError(null);
+  };
+  useEffect(() => {
+    current.current.alive = true;
+    const listener = SyncNative?.addListener("onRecoveryInvalidated", invalidate);
+    return () => {
+      current.current.alive = false;
+      current.current.generation++;
+      current.current.unlocked = false;
+      listener?.remove();
+      SyncNative?.revokeRecoveryAuthorization();
+    };
+  }, []);
+  const run = async <T,>(action: (valid: () => boolean) => Promise<T | null | undefined>, accept?: (value: T) => void, authorize = false) => {
+    if (current.current.busy || (!authorize && !current.current.unlocked)) return;
+    const generation = current.current.generation;
+    const valid = () => current.current.alive && current.current.generation === generation;
+    current.current.busy = true;
+    setBusy(true);
+    setError(null);
+    try {
+      if (authorize) {
+        const allowed = await SyncNative?.authorizeRecovery();
+        if (!valid() || !allowed) return;
+        current.current.unlocked = true;
+        setUnlocked(true);
+      }
+      const result = await action(valid);
+      if (!valid()) return;
+      if (result == null) invalidate();
+      else accept?.(result);
+    } catch {
+      if (valid()) setError("Couldn’t open the recovery kit. Please try again.");
+    } finally {
+      if (valid()) {
+        current.current.busy = false;
+        setBusy(false);
+      }
+    }
+  };
+  const close = () => {
+    invalidate();
+    SyncNative?.revokeRecoveryAuthorization();
+    closeSettingsSheet();
+  };
+  return { unlocked, busy, error, run, close };
+}
+
 function RecoveryKitSheet() {
   const theme = useTheme();
   const colors = useFormColors();
   const [preview, setPreview] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
-  useEffect(() => void SyncNative?.recoveryKitPreview(168).then(setPreview), []);
-  const save = async (format: "pdf" | "text") => {
+  const access = useRecoveryAccess(() => { setPreview(null); setSaved(null); });
+  const unlock = () => access.run(async () => SyncNative?.recoveryKitPreview(168), setPreview, true);
+  const save = (format: "pdf" | "text") => access.run(async () => {
     const path = await SyncNative?.saveRecoveryKit(format);
-    if (path) setSaved(path);
-  };
+    return { path };
+  }, ({ path }) => { if (path) setSaved(path); });
   const more = async () => {
-    const choice = await showMenu([
-      { id: "copy", title: "Copy", symbol: "doc.on.doc" },
-      { id: "share", title: "Share…", symbol: "square.and.arrow.up" },
-      { separator: true },
-      { id: "text", title: "Save as Text…", symbol: "doc.plaintext" },
-    ]);
-    if (choice === "copy") await SyncNative?.copyRecoveryKit();
-    else if (choice === "share") await SyncNative?.shareRecoveryKit();
-    else if (choice === "text") await save("text");
+    await access.run(async (valid) => {
+      const choice = await showMenu([
+        { id: "copy", title: "Copy", symbol: "doc.on.doc" },
+        { id: "share", title: "Share…", symbol: "square.and.arrow.up" },
+        { separator: true },
+        { id: "text", title: "Save as Text…", symbol: "doc.plaintext" },
+      ]);
+      if (!valid()) return null;
+      if (choice === "copy") return await SyncNative?.copyRecoveryKit() ? {} : null;
+      if (choice === "share") return await SyncNative?.shareRecoveryKit() ? {} : null;
+      if (choice === "text") return { path: await SyncNative?.saveRecoveryKit("text") };
+      return {};
+    }, (result) => { if ("path" in result && result.path) setSaved(result.path); });
   };
   return (
-    <Sheet width={460} onClose={closeSettingsSheet}>
+    <Sheet width={460} onClose={access.close}>
       <View style={{ flexDirection: "row", gap: 18 }}>
         <View style={{ flex: 1 }}>
           <Title>Save Your Recovery Kit</Title>
@@ -72,11 +140,12 @@ function RecoveryKitSheet() {
           >
             <Symbol name="exclamationmark.triangle.fill" size={12} color="#FF9500" style={{ width: 16, height: 16 }} />
             <Text style={{ flex: 1, fontSize: 12, lineHeight: 16, color: theme.textPrimary }}>
-              Save a copy of your Recovery Kit to{" "}
-              <Text style={{ textDecorationLine: "underline" }}>another</Text> device or to the cloud. You’ll need it if you lose access to this device.
+              This file contains your unencrypted recovery phrase. Anyone with it can read your synced data. Keep it somewhere private, away from this Mac.
             </Text>
           </View>
           {saved ? <Body style={{ marginTop: 10 }}>Saved to {saved.replace(/^\/Users\/[^/]+/, "~")}.</Body> : null}
+          {!access.unlocked ? <Body>Unlock with Touch ID or your Mac password to view or export it.</Body> : null}
+          {access.error ? <Body>{access.error}</Body> : null}
         </View>
         <View
           accessibilityLabel="Recovery kit preview"
@@ -85,9 +154,11 @@ function RecoveryKitSheet() {
           {preview ? <Image source={{ uri: preview }} style={{ width: 168, height: 217 }} /> : null}
         </View>
       </View>
-      <Buttons left={<Button title="Other Options" onPress={() => void more()} />}>
-        <Button title="Close" onPress={closeSettingsSheet} />
-        <Button title="Save…" kind="primary" onPress={() => void save("pdf")} />
+      <Buttons left={access.unlocked ? <Button title="Other Options" disabled={access.busy} onPress={() => void more()} /> : undefined}>
+        <Button title="Close" onPress={access.close} />
+        {access.unlocked
+          ? <Button title="Save…" kind="primary" disabled={access.busy} onPress={() => void save("pdf")} />
+          : <Button title={access.busy ? "Unlocking…" : "Unlock Recovery Kit"} kind="primary" disabled={access.busy} onPress={() => void unlock()} />}
       </Buttons>
     </Sheet>
   );
@@ -198,22 +269,24 @@ function ConnectDeviceSheet() {
   const colors = useFormColors();
   const [qr, setQr] = useState<string | null>(null);
   const [words, setWords] = useState<string[] | null>(null);
-  useEffect(() => void SyncNative?.qrCode().then(setQr), []);
+  const access = useRecoveryAccess(() => { setQr(null); setWords(null); });
+  const unlock = () => access.run(async () => SyncNative?.qrCode(), setQr, true);
   return (
-    <Sheet width={480} onClose={closeSettingsSheet}>
+    <Sheet width={480} onClose={access.close}>
       <Title>Connect Another Device</Title>
       <Body>
         On your other Mac, open Ardia › Settings › Sync and choose the same sync folder. Then click Enter Recovery Phrase and enter the 24 words
         of your recovery phrase.
       </Body>
-      <View style={{ flexDirection: "row", alignItems: "center", gap: 16, marginTop: 16 }}>
+      {access.unlocked ? <View style={{ flexDirection: "row", alignItems: "center", gap: 16, marginTop: 16 }}>
         <View style={{ width: 132, height: 132, borderRadius: 8, backgroundColor: "#FFFFFF", alignItems: "center", justifyContent: "center" }}>
           {qr ? <Image source={{ uri: qr }} style={{ width: 120, height: 120 }} /> : null}
         </View>
         <Text style={{ flex: 1, fontSize: 12, lineHeight: 16, color: theme.textSecondary }}>
-          Or scan this code with your iPhone’s camera to copy the words, then paste them on your other Mac with Universal Clipboard.
+          This code contains your recovery phrase. Anyone with it can read your synced data. Clipboard copies stay on this Mac and expire after one minute.
         </Text>
-      </View>
+      </View> : <Body>Unlock with Touch ID or your Mac password to reveal your recovery phrase.</Body>}
+      {access.error ? <Body>{access.error}</Body> : null}
       {words ? (
         <View style={{ flexDirection: "row", flexWrap: "wrap", marginTop: 14, padding: 10, borderRadius: 8, backgroundColor: colors.group }}>
           {words.map((w, i) => (
@@ -226,13 +299,14 @@ function ConnectDeviceSheet() {
       ) : null}
       <Buttons
         left={
-          <>
-            <Button title={words ? "Hide Words" : "Show Words"} onPress={() => (words ? setWords(null) : void SyncNative?.recoveryWords().then(setWords))} />
-            <Button title="Copy Words" onPress={() => void SyncNative?.copyRecoveryPhrase()} />
-          </>
+          access.unlocked ? <>
+            <Button title={words ? "Hide Words" : "Show Words"} disabled={access.busy} onPress={() => (words ? setWords(null) : void access.run(async () => SyncNative?.recoveryWords(), setWords))} />
+            <Button title="Copy Words" disabled={access.busy} onPress={() => void access.run(async () => SyncNative?.copyRecoveryPhrase())} />
+          </> : undefined
         }
       >
-        <Button title="Done" kind="primary" onPress={closeSettingsSheet} />
+        <Button title="Done" kind={access.unlocked ? "primary" : undefined} onPress={access.close} />
+        {!access.unlocked ? <Button title={access.busy ? "Unlocking…" : "Unlock Recovery Phrase"} kind="primary" disabled={access.busy} onPress={() => void unlock()} /> : null}
       </Buttons>
     </Sheet>
   );
