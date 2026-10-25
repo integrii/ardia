@@ -10,7 +10,7 @@ private struct ExactLoginStore {
 }
 
 @MainActor
-private final class FixtureStore: PasswordSyncStore {
+private final class FixtureStore: PasswordSyncStore, PasswordSyncStoreLifecycle {
   var values = ExactLoginStore()
   var reads = 0
   var writes = 0
@@ -22,23 +22,33 @@ private final class FixtureStore: PasswordSyncStore {
   var delayedWrite: (() -> Void)?
   var delayWrite = false
   var extraRows: [PasswordSyncLogin] = []
+  var cancellations = 0
+  var requestDeadlines: [TimeInterval] = []
 
-  func read(profile: String, authorized: @escaping () -> Bool, completion: @escaping ([PasswordSyncLogin]?) -> Void) {
+  func beginAuthorization(profiles: [String], expiresAt: TimeInterval, generation: UInt64) -> Bool { true }
+  func revokeAuthorization() { cancelPendingRequests() }
+  func cancelPendingRequests() { cancellations += 1 }
+
+  func read(profile: String, expiresAt: TimeInterval, authorized: @escaping () -> Bool, completion: @escaping ([PasswordSyncLogin]?) -> Void) {
+    requestDeadlines.append(expiresAt)
     reads += 1
     beforeRead?()
     completion(authorized() && !unavailable ? Array(values.values) + extraRows : nil)
   }
 
   func compareAndSet(profile: String, key: String, expected: PasswordSyncLogin?, desired: PasswordSyncLogin?,
-                     authorized: @escaping () -> Bool, completion: @escaping (Bool?) -> Void) {
+                     expiresAt: TimeInterval, authorized: @escaping () -> Bool, completion: @escaping (Bool?) -> Void) {
+    requestDeadlines.append(expiresAt)
     let write = {
       self.beforeWrite?()
-      guard authorized(), !self.failWrite, self.values[key] == expected else { completion(false); return }
+      let current = self.values[key]
+      let matches = current == nil ? expected == nil : expected.map { current!.password.utf8.elementsEqual($0.password.utf8) } == true
+      guard authorized(), !self.failWrite, matches else { completion(false); return }
       self.writes += 1
       if !self.failSettle {
         self.values[key] = desired.map { login in
           PasswordSyncLogin(origin: login.origin, username: login.username, password: login.password,
-                            created: expected == nil ? login.created : expected?.created)
+                            created: current == nil ? login.created : current?.created)
         }
       }
       completion(true)
@@ -99,9 +109,11 @@ private struct PasswordSyncBridgeTests {
     let unsettled = await sync.apply(binding, changes: changes)
     precondition(!unsettled && store.values[key] == old)
     store.failSettle = false
+    store.requestDeadlines = []
     let retried = await sync.apply(binding, changes: changes)
     precondition(retried && store.values[key]?.password == desired.password)
     precondition(store.values[key]?.created == old.created, "password update must preserve the native creation date")
+    precondition(store.requestDeadlines.count >= 3 && Set(store.requestDeadlines).count == 1, "read, CAS, and settle share the original absolute operation deadline")
     let writes = store.writes
     let idempotent = await sync.apply(binding, changes: changes)
     precondition(idempotent && store.writes == writes)
@@ -132,8 +144,10 @@ private struct PasswordSyncBridgeTests {
     precondition(!badFingerprint && !plaintext && !invalidKey && store.values[key] == old)
 
     store.delayWrite = true
+    let cancellationsBeforeTimeout = store.cancellations
     let timedOut = await sync.apply(binding, changes: changes)
     precondition(!timedOut && store.values[key] == old)
+    precondition(store.cancellations > cancellationsBeforeTimeout, "timeout cancels native requests before the caller resumes")
     store.delayedWrite?()
     precondition(store.values[key] == old)
     store.delayWrite = false
@@ -173,6 +187,38 @@ private struct PasswordSyncBridgeTests {
     precondition(datedRows?.first(where: { $0["key"] as? String == undatedLogin.key })?["created"] is NSNull)
     precondition(datedRows?.first(where: { $0["key"] as? String == old.key })?["created"] as? Double == 1)
     store.extraRows = []
+
+    for created: Double? in [nil, 0, 1_234_567_890_123.5] {
+      let source = PasswordSyncLogin(origin: old.origin, username: "source-date", password: "dated-secret", created: created)
+      let sourceKey = source.key!
+      store.values[sourceKey] = source
+      let sourceRows = await sync.read(binding)
+      let sourceRow = sourceRows!.first { $0["key"] as? String == sourceKey }!
+      let value = sourceRow["value"] as! [String: Any]
+      let authenticated = try codec.open(PasswordSyncEnvelope(value)!, key: sourceKey, binding: binding)
+      precondition(authenticated.created == created, "native read seals the original source date")
+      store.values[sourceKey] = nil
+      let inserted = await sync.apply(binding, changes: [["key": sourceKey, "desired": value, "base": NSNull()]])
+      precondition(inserted && store.values[sourceKey]?.created == created, "incoming authenticated source date reaches fixture insertion")
+      let dateOnly = PasswordSyncLogin(origin: source.origin, username: source.username, password: source.password, created: 999)
+      let writesBeforeDateOnly = store.writes
+      let dateOnlyValue = try codec.seal(dateOnly, key: sourceKey, binding: binding).json
+      let unchanged = await sync.apply(binding, changes: [["key": sourceKey, "desired": dateOnlyValue, "base": value]])
+      precondition(unchanged && store.writes == writesBeforeDateOnly && store.values[sourceKey]?.created == created, "date-only metadata differences neither rewrite existing dates nor conflict")
+      let update = PasswordSyncLogin(origin: source.origin, username: source.username, password: "updated-dated-secret", created: 123)
+      let updateValue = try codec.seal(update, key: sourceKey, binding: binding).json
+      let updated = await sync.apply(binding, changes: [["key": sourceKey, "desired": updateValue, "base": dateOnlyValue]])
+      precondition(updated && store.values[sourceKey]?.created == created, "existing fixture creation date wins over incoming update metadata")
+      store.values[sourceKey] = nil
+    }
+    store.values[key] = old
+    store.beforeWrite = { store.values[key] = PasswordSyncLogin(origin: old.origin, username: old.username, password: old.password, created: 765) }
+    let dateRace = await sync.apply(binding, changes: changes)
+    precondition(dateRace && store.values[key]?.password == desired.password && store.values[key]?.created == 765, "date-only concurrent changes do not block password CAS")
+    store.beforeWrite = nil
+    store.values[key] = old
+    let forgedDate = await sync.apply(binding, changes: [["key": key, "desired": wanted, "base": base, "created": 5]])
+    precondition(!forgedDate && store.values[key] == old, "JS date outside sealed credentials is rejected")
 
     let deleted = await sync.apply(binding, changes: [["key": key, "desired": NSNull(), "base": base]])
     precondition(deleted && store.values[key] == nil)

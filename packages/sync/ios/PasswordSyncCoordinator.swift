@@ -37,6 +37,7 @@ final class PasswordSyncCoordinator {
     authorization = DeviceOwnerAuthorization(authentication: authentication, lifetime: 24 * 60 * 60, now: now, observeSystem: false)
     authorization.onInvalidate = { [weak self] _ in
       guard let self else { return }
+      (self.store as? any PasswordSyncStoreLifecycle)?.revokeAuthorization()
       self.approval = nil
       self.grant = nil
       self.onInvalidate()
@@ -82,7 +83,16 @@ final class PasswordSyncCoordinator {
         guard let self, self.current(request) else { return nil }
         return request.identity
       }) { [weak self] grant in
-        guard let self, let grant, self.current(request) else { return continuation.resume(returning: false) }
+        guard let self, let grant else { return continuation.resume(returning: false) }
+        guard self.current(request), self.authorization.validate(grant, binding: request.identity) else {
+          self.revoke()
+          return continuation.resume(returning: false)
+        }
+        if let lifecycle = self.store as? any PasswordSyncStoreLifecycle,
+           !lifecycle.beginAuthorization(profiles: request.bindings.map(\.profile), expiresAt: grant.expiresAt, generation: request.snapshot.generation) {
+          self.revoke()
+          return continuation.resume(returning: false)
+        }
         self.approval = request
         self.grant = grant
         continuation.resume(returning: true)
@@ -90,7 +100,9 @@ final class PasswordSyncCoordinator {
     }
   }
 
-  func revoke() { authorization.revoke() }
+  func revoke() {
+    authorization.revoke()
+  }
 
   func status(folder: String, scope: String, profile: String) -> Bool {
     guard let binding = binding(folder: folder, scope: scope, profile: profile) else { return false }

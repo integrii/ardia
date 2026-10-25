@@ -12,6 +12,8 @@
 namespace {
 
 using ardiacore_password_sync::PasswordSyncAuthorized;
+using ardiacore_password_sync::PasswordSyncBeginCommit;
+using ardiacore_password_sync::PasswordSyncEndCommit;
 using ardiacore_password_sync::PasswordSyncCall;
 using ardiacore_password_sync::PasswordSyncDone;
 using ardiacore_password_sync::PasswordSyncHolder;
@@ -28,26 +30,28 @@ void *Symbol(const char *name) {
 
 bool PasswordSyncSymbol(NSString *name) {
   const char *symbol = name.UTF8String;
-  return symbol && (!strcmp(symbol, "ac_passwords_sync_read") || !strcmp(symbol, "ac_passwords_sync_compare_and_set"));
+  return symbol && (!strcmp(symbol, "ac_passwords_sync_read") || !strcmp(symbol, "ac_passwords_sync_compare_and_set") ||
+                    !strcmp(symbol, "ac_passwords_sync_compare_and_set_v2"));
 }
 
 void StartPasswordSync(NSString *profile, PasswordSyncHolder request,
                        ac_passwords_sync_read_t read,
-                       ac_passwords_sync_compare_and_set_t write) {
-  if (!request->Allowed() || ardiacore_host::IsIncognito(profile) || (!read && !write)) return request->Finish(false);
+                       ac_passwords_sync_compare_and_set_v2_t write) {
+  if (!request->Allowed() || ardiacore_host::IsIncognito(profile)) return request->Finish(AC_PASSWORDS_SYNC_UNAUTHORIZED);
+  if (!read && !write) return request->Finish(AC_PASSWORDS_SYNC_ERROR);
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-    request->Finish(false);
+    request->Finish(AC_PASSWORDS_SYNC_ERROR);
   });
   ardiacore_host::WithProfile(profile ?: @"", ^(ArdiaCoreProfile *p) {
     if (!request->Allowed() || !p || !ArdiaCoreHost.isStarted || ([p respondsToSelector:@selector(offTheRecord)] && p.offTheRecord)) {
-      return request->Finish(false);
+      return request->Finish(AC_PASSWORDS_SYNC_UNAUTHORIZED);
     }
     auto holder = new PasswordSyncHolder(request);
     if (read) {
       read(p.path.UTF8String, PasswordSyncAuthorized, PasswordSyncLogin, PasswordSyncDone, holder);
     } else {
       NSMutableData *secret = request->secret;
-      write(p.path.UTF8String, (const char *)secret.bytes, PasswordSyncAuthorized, PasswordSyncDone, holder);
+      write(p.path.UTF8String, (const char *)secret.bytes, PasswordSyncAuthorized, PasswordSyncBeginCommit, PasswordSyncEndCommit, PasswordSyncDone, holder);
       WipeSecret(secret);
       request->secret = nil;
     }
@@ -213,32 +217,35 @@ void InstallSink() {
   InstallSink();
 }
 
-+ (void)readPasswordsForSync:(NSString *)profile authorized:(BOOL (^)(void))authorized
++ (void)readPasswordsForSync:(NSString *)profile request:(ArdiaCorePasswordSyncRequest *)nativeRequest authorized:(BOOL (^)(void))authorized
                 completion:(void (^)(NSArray<NSDictionary<NSString *, id> *> *))completion {
   if (![NSThread isMainThread]) {
-    dispatch_async(dispatch_get_main_queue(), ^{ [self readPasswordsForSync:profile authorized:authorized completion:completion]; });
+    dispatch_async(dispatch_get_main_queue(), ^{ [self readPasswordsForSync:profile request:nativeRequest authorized:authorized completion:completion]; });
     return;
   }
   auto request = std::make_shared<PasswordSyncCall>();
+  request->lease = [nativeRequest leaseForProfile:profile];
   request->authorized = [authorized copy];
-  request->completion = ^(BOOL success, NSArray<NSDictionary<NSString *, id> *> *rows) { completion(success ? rows : nil); };
+  request->completion = ^(ArdiaCorePasswordSyncStatus status, NSArray<NSDictionary<NSString *, id> *> *rows) { completion(status == ArdiaCorePasswordSyncStatusCommitted ? rows : nil); };
   auto read = reinterpret_cast<ac_passwords_sync_read_t>(Symbol("ac_passwords_sync_read"));
   StartPasswordSync(profile, request, read, nullptr);
 }
 
-+ (void)compareAndSetPasswordForSync:(NSString *)profile args:(NSMutableData *)args authorized:(BOOL (^)(void))authorized
-                        completion:(void (^)(BOOL))completion {
++ (void)compareAndSetPasswordForSync:(NSString *)profile args:(NSMutableData *)args request:(ArdiaCorePasswordSyncRequest *)nativeRequest authorized:(BOOL (^)(void))authorized
+                        completion:(void (^)(ArdiaCorePasswordSyncStatus))completion {
   if (![NSThread isMainThread]) {
-    dispatch_async(dispatch_get_main_queue(), ^{ [self compareAndSetPasswordForSync:profile args:args authorized:authorized completion:completion]; });
+    dispatch_async(dispatch_get_main_queue(), ^{ [self compareAndSetPasswordForSync:profile args:args request:nativeRequest authorized:authorized completion:completion]; });
     return;
   }
   auto request = std::make_shared<PasswordSyncCall>();
+  request->mutation = true;
+  request->lease = [nativeRequest leaseForProfile:profile];
   request->authorized = [authorized copy];
-  request->completion = ^(BOOL success, NSArray<NSDictionary<NSString *, id> *> *) { completion(success); };
+  request->completion = ^(ArdiaCorePasswordSyncStatus status, NSArray<NSDictionary<NSString *, id> *> *) { completion(status); };
   request->secret = args;
   const char *bytes = (const char *)args.bytes;
-  if (!args.length || bytes[args.length - 1] != 0) return request->Finish(false);
-  auto write = reinterpret_cast<ac_passwords_sync_compare_and_set_t>(Symbol("ac_passwords_sync_compare_and_set"));
+  if (!args.length || bytes[args.length - 1] != 0) return request->Finish(AC_PASSWORDS_SYNC_ERROR);
+  auto write = reinterpret_cast<ac_passwords_sync_compare_and_set_v2_t>(Symbol("ac_passwords_sync_compare_and_set_v2"));
   StartPasswordSync(profile, request, nullptr, write);
 }
 

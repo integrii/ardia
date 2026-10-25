@@ -122,6 +122,46 @@ final class PasswordRecordsTests: XCTestCase {
     XCTAssertNotEqual(first.fingerprint, try passwords.seal(login, scope: "p:other", recordKey: login.recordKey).fingerprint)
   }
 
+  func testCreationMetadataIsAuthenticatedWithoutChangingEditFingerprint() throws {
+    let undated = try passwords.seal(login, scope: scope, recordKey: login.recordKey)
+    for created: Double? in [nil, 0, 1_234_567_890_123.5, -1] {
+      let credential = PasswordRecords.Credentials(origin: login.origin, username: login.username, password: login.password, created: created)
+      let value = try passwords.seal(credential, scope: scope, recordKey: login.recordKey)
+      XCTAssertEqual(value.fingerprint, undated.fingerprint)
+      XCTAssertEqual(try passwords.open(value, scope: scope, recordKey: login.recordKey).created, created)
+      for source in [log(credential.legacyValue), snapshot(credential.legacyValue)] {
+        let incoming = try passwords.transformWire(scope: scope, payload: encode(source))
+        assertSecretAbsent(incoming)
+        let restored = try passwords.outboundLegacyWire(scope: scope, payload: incoming)
+        XCTAssertEqual(try decode(restored) as NSDictionary, source as NSDictionary)
+      }
+      var overridden = value.json
+      overridden["c"] = 123
+      XCTAssertThrowsError(try passwords.value(from: overridden, scope: scope, recordKey: login.recordKey))
+      var bytes = try XCTUnwrap(Data(base64Encoded: value.sealed))
+      bytes[12] ^= 1
+      XCTAssertThrowsError(try passwords.open(.init(sealed: bytes.base64EncodedString(), fingerprint: value.fingerprint), scope: scope, recordKey: login.recordKey))
+    }
+    XCTAssertEqual(Set(login.legacyValue.keys), ["o", "u", "p"])
+  }
+
+  func testCreationMetadataRejectsInvalidTypesNonfiniteAndOutOfRangeTimes() throws {
+    for created: Any in [true, false, "0", [], ["ms": 0], 8_640_000_000_000_001.0, -8_640_000_000_000_001.0] {
+      var raw = login.legacyValue
+      raw["c"] = created
+      XCTAssertThrowsError(try passwords.transformWire(scope: scope, payload: encode(log(raw))))
+    }
+    for created in [Double.nan, Double.infinity, -Double.infinity, 8_640_000_000_000_001.0, -8_640_000_000_000_001.0] {
+      let invalid = PasswordRecords.Credentials(origin: login.origin, username: login.username, password: login.password, created: created)
+      XCTAssertThrowsError(try passwords.seal(invalid, scope: scope, recordKey: login.recordKey))
+    }
+    var raw = login.legacyValue
+    raw["c"] = NSNull()
+    let incoming = try decode(passwords.transformWire(scope: scope, payload: encode(log(raw))))
+    let value = try passwords.value(from: operationValue(incoming), scope: scope, recordKey: login.recordKey)
+    XCTAssertNil(try passwords.open(value, scope: scope, recordKey: login.recordKey).created)
+  }
+
   func testEmptyAndUnicodePasswordsPreserveExactBytes() throws {
     for secret in ["", "密碼🔑\n\u{0000}résumé", "é", "e\u{0301}"] {
       let credential = PasswordRecords.Credentials(origin: "https://例子.example", username: "用戶\n第二行", password: secret)

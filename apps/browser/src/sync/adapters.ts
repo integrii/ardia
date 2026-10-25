@@ -1141,7 +1141,7 @@ export function passwordsAdapter(
       const dates = new Map<string, number | null>();
       for (const record of records) {
         if (!record.key.startsWith("pw:") || !passwordValue(record.value) || values.has(record.key)) return null;
-        if (record.created !== null && (typeof record.created !== "number" || !Number.isFinite(record.created))) return null;
+        if (!passwordCreated(record.created)) return null;
         const known = base(record.key);
         values.set(record.key, passwordValue(known) && known.fingerprint === record.value.fingerprint ? known : record.value);
         dates.set(record.value.fingerprint, record.created);
@@ -1172,7 +1172,7 @@ export function passwordsAdapter(
       if (!local) return false;
       const current = new Map<string, PasswordValue>();
       for (const record of local) {
-        if (!record.key.startsWith("pw:") || !passwordValue(record.value) || current.has(record.key)) return false;
+        if (!record.key.startsWith("pw:") || !passwordValue(record.value) || !passwordCreated(record.created) || current.has(record.key)) return false;
         current.set(record.key, record.value);
       }
       for (const change of changes) {
@@ -1185,6 +1185,10 @@ export function passwordsAdapter(
       return applied === true;
     },
   };
+}
+
+function passwordCreated(value: unknown): value is number | null {
+  return value === null || (typeof value === "number" && Number.isFinite(value) && Math.abs(value) <= 8_640_000_000_000_000);
 }
 
 function passwordValue(value: unknown): value is PasswordValue {

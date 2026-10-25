@@ -16,18 +16,28 @@ final class AuthorizationFixtureAuthentication: DeviceOwnerAuthenticating {
 }
 
 @MainActor
-final class AuthorizationFixtureStore: PasswordSyncStore {
+final class AuthorizationFixtureStore: PasswordSyncStore, PasswordSyncStoreLifecycle {
   var reads = 0
   var writes = 0
+  var nativeGrants: [(profiles: [String], expiresAt: TimeInterval, generation: UInt64)] = []
+  var allowNativeGrant = true
+  var revocations = 0
+  var cancellations = 0
   var onRead: (() -> Void)?
-  func read(profile: String, authorized: @escaping () -> Bool, completion: @escaping ([PasswordSyncLogin]?) -> Void) {
+  func beginAuthorization(profiles: [String], expiresAt: TimeInterval, generation: UInt64) -> Bool {
+    nativeGrants.append((profiles, expiresAt, generation))
+    return allowNativeGrant
+  }
+  func revokeAuthorization() { revocations += 1; cancelPendingRequests() }
+  func cancelPendingRequests() { cancellations += 1 }
+  func read(profile: String, expiresAt: TimeInterval, authorized: @escaping () -> Bool, completion: @escaping ([PasswordSyncLogin]?) -> Void) {
     let allowed = authorized()
     reads += 1
     onRead?()
     completion(allowed ? [] : nil)
   }
   func compareAndSet(profile: String, key: String, expected: PasswordSyncLogin?, desired: PasswordSyncLogin?,
-                     authorized: @escaping () -> Bool, completion: @escaping (Bool?) -> Void) {
+                     expiresAt: TimeInterval, authorized: @escaping () -> Bool, completion: @escaping (Bool?) -> Void) {
     writes += 1
     completion(authorized())
   }
@@ -176,6 +186,64 @@ struct PasswordAuthorizationChecks {
     try FileManager.default.removeItem(at: original)
     try FileManager.default.moveItem(at: parked, to: original)
     check(!target.status(folder: original.path, scope: scope, profile: ""), "restoring the original folder target cannot resurrect a revoked grant")
+
+    let leaseFolder = base.appendingPathComponent("lease", isDirectory: true)
+    try SyncVault(folder: leaseFolder, keys: keys).createChain()
+    let leaseAuth = AuthorizationFixtureAuthentication()
+    let leaseStore = AuthorizationFixtureStore()
+    var leaseNow: TimeInterval = 123
+    var leaseGeneration: UInt64 = 42
+    let lease = PasswordSyncCoordinator(store: leaseStore, authentication: leaseAuth,
+      snapshot: { PasswordSyncKeySnapshot(keys: keys, generation: leaseGeneration) }, foreground: { true },
+      now: { leaseNow }, observeSystem: false, onInvalidate: {})
+    leaseAuth.onEvaluate = { check(leaseStore.nativeGrants.isEmpty, "native lease does not start before device-owner approval") }
+    leaseAuth.answer = false
+    let deniedLease = await lease.authorize(folder: leaseFolder.path, profiles: profiles)
+    check(!deniedLease && leaseStore.nativeGrants.isEmpty, "rejected authentication cannot begin a native lease")
+    leaseAuth.answer = true
+    let approvedLease = await lease.authorize(folder: leaseFolder.path, profiles: profiles)
+    check(approvedLease && leaseStore.nativeGrants.count == 1, "successful device-owner approval starts one native lease")
+    check(leaseStore.nativeGrants.first?.profiles == [""], "native lease receives only approved engine profiles")
+    check(leaseStore.nativeGrants.first?.expiresAt == 123 + 24 * 60 * 60, "native lease receives the original absolute grant expiry")
+    check(leaseStore.nativeGrants.first?.generation == 42, "native lease carries the key snapshot generation")
+    leaseAuth.onEvaluate = nil
+    leaseNow += 30
+    let reusedLease = await lease.authorize(folder: leaseFolder.path, profiles: profiles)
+    check(reusedLease && leaseAuth.calls == 2 && leaseStore.nativeGrants.count == 1, "reusing consent never renews its native expiry")
+    let revocationsBeforeGeneration = leaseStore.revocations
+    leaseGeneration += 1
+    check(!lease.status(folder: leaseFolder.path, scope: scope, profile: ""), "key generation change denies the approved binding")
+    check(leaseStore.revocations == revocationsBeforeGeneration + 1, "key generation change revokes the native lease exactly once")
+    leaseStore.allowNativeGrant = false
+    let rejectedNativeLease = await lease.authorize(folder: leaseFolder.path, profiles: profiles)
+    check(!rejectedNativeLease && leaseStore.nativeGrants.count == 2, "native lease registration rejection fails authorization closed")
+    check(!lease.status(folder: leaseFolder.path, scope: scope, profile: ""), "native lease rejection leaves no approved session")
+    leaseStore.allowNativeGrant = true
+    let retriedLease = await lease.authorize(folder: leaseFolder.path, profiles: profiles)
+    check(retriedLease && leaseAuth.calls == 4, "retry after native lease rejection requires another device-owner grant")
+    check(leaseStore.nativeGrants.last?.generation == 43, "replacement lease uses the new generation")
+    let revocationsBeforeExpiry = leaseStore.revocations
+    leaseNow = leaseStore.nativeGrants.last!.expiresAt
+    check(!lease.status(folder: leaseFolder.path, scope: scope, profile: ""), "exact grant deadline denies coordinator access")
+    check(leaseStore.revocations == revocationsBeforeExpiry + 1, "grant expiry revokes the native lease exactly once")
+    lease.revoke()
+    lease.revoke()
+    check(leaseStore.revocations == revocationsBeforeExpiry + 1, "repeated revocation of an expired session does not revoke a second native lease")
+    let cancellationsBeforeDeniedRead = leaseStore.cancellations
+    let readWithoutLease = await lease.read(folder: leaseFolder.path, scope: scope, profile: "")
+    check(readWithoutLease == nil && leaseStore.reads == 0, "revoked authorization never reaches a native read")
+    check(leaseStore.cancellations == cancellationsBeforeDeniedRead, "denied operations do not create requests requiring cancellation")
+
+    let handoffStore = AuthorizationFixtureStore()
+    var handoffSnapshots = 0
+    let handoff = PasswordSyncCoordinator(store: handoffStore, authentication: AuthorizationFixtureAuthentication(),
+      snapshot: {
+        handoffSnapshots += 1
+        return handoffSnapshots == 4 ? nil : PasswordSyncKeySnapshot(keys: keys, generation: 1)
+      }, foreground: { true }, observeSystem: false, onInvalidate: {})
+    let changedAtHandoff = await handoff.authorize(folder: leaseFolder.path, profiles: profiles)
+    check(!changedAtHandoff && handoffStore.nativeGrants.isEmpty, "key change at grant handoff never registers a native lease")
+    check(handoffStore.revocations == 1, "invalid grant handoff revokes the just-issued approval exactly once")
     print("\(failures == 0 ? "PASS" : "FAIL"): \(checks) password authorization checks, \(failures) failures")
     if failures > 0 { exit(1) }
   }

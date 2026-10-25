@@ -14,21 +14,41 @@ final class FixtureAuthentication: DeviceOwnerAuthenticating {
 }
 
 @MainActor
-final class FixturePasswordStore: PasswordSyncStore {
+final class FixturePasswordStore: PasswordSyncStore, PasswordSyncStoreLifecycle {
   var reads = 0
   var writes = 0
   var logins: [PasswordSyncLogin] = []
   var deferRead = false
   var pending: (([PasswordSyncLogin]?) -> Void)?
-  func read(profile: String, authorized: @escaping () -> Bool, completion: @escaping ([PasswordSyncLogin]?) -> Void) {
-    guard authorized() else { return completion(nil) }
+  var nativeAuthorized = false
+  var authorizedProfiles: [String] = []
+  var authorizationDeadlines: [TimeInterval] = []
+  var authorizationGenerations: [UInt64] = []
+  var revocations = 0
+  var cancellations = 0
+  var rejectAuthorization = false
+  func beginAuthorization(profiles: [String], expiresAt: TimeInterval, generation: UInt64) -> Bool {
+    authorizationDeadlines.append(expiresAt)
+    authorizationGenerations.append(generation)
+    authorizedProfiles = profiles
+    nativeAuthorized = !rejectAuthorization
+    return nativeAuthorized
+  }
+  func revokeAuthorization() {
+    nativeAuthorized = false
+    revocations += 1
+    cancelPendingRequests()
+  }
+  func cancelPendingRequests() { cancellations += 1 }
+  func read(profile: String, expiresAt: TimeInterval, authorized: @escaping () -> Bool, completion: @escaping ([PasswordSyncLogin]?) -> Void) {
+    guard nativeAuthorized, authorizedProfiles.contains(profile), authorized() else { return completion(nil) }
     reads += 1
     if deferRead { pending = completion }
     else { completion(logins) }
   }
   func compareAndSet(profile: String, key: String, expected: PasswordSyncLogin?, desired: PasswordSyncLogin?,
-                     authorized: @escaping () -> Bool, completion: @escaping (Bool?) -> Void) {
-    guard authorized(), logins.first(where: { $0.key?.utf8.elementsEqual(key.utf8) == true }) == expected else { return completion(false) }
+                     expiresAt: TimeInterval, authorized: @escaping () -> Bool, completion: @escaping (Bool?) -> Void) {
+    guard nativeAuthorized, authorizedProfiles.contains(profile), authorized(), logins.first(where: { $0.key?.utf8.elementsEqual(key.utf8) == true }) == expected else { return completion(false) }
     writes += 1
     logins.removeAll { $0.key?.utf8.elementsEqual(key.utf8) == true }
     if let desired {
@@ -246,14 +266,19 @@ struct PasswordIntegrationChecks {
     check(!coordinator.status(folder: folder.path, scope: scope, profile: ""), "startup never inherits persisted authorization")
     let lockedRead = await coordinator.read(folder: folder.path, scope: scope, profile: "")
     check(lockedRead == nil && auth.calls == 0 && store.reads == 0, "sync reads never prompt or read without approval")
+    check(store.authorizationDeadlines.isEmpty && !store.nativeAuthorized, "no native lease is minted before device-owner approval")
     foreground = false
     let hidden = await coordinator.authorize(folder: folder.path, profiles: profiles)
     check(!hidden && auth.calls == 0, "only explicit foreground authorization can prompt")
     foreground = true
     let allowed = await coordinator.authorize(folder: folder.path, profiles: profiles)
     check(allowed && auth.calls == 1, "one prompt approves the exact batch")
+    check(store.nativeAuthorized && store.authorizedProfiles == ["", "profile-second"], "successful device-owner grant begins exact native profile authorization")
+    check(store.authorizationDeadlines == [100 + 24 * 60 * 60], "native lease receives the original immutable device-owner deadline")
+    check(store.authorizationGenerations == [generation], "native lease is bound to the exact approved key generation")
     let reordered = await coordinator.authorize(folder: folder.path, profiles: Array(profiles.reversed()))
     check(reordered && auth.calls == 1, "identical sorted binding set reuses current consent")
+    check(store.authorizationDeadlines.count == 1, "cached approval does not mint or extend a native lease")
     let duplicate = await coordinator.authorize(folder: folder.path, profiles: [profiles[0], profiles[0]])
     check(!duplicate && auth.calls == 1, "duplicate binding batches rejected before authentication")
     check(coordinator.status(folder: folder.path, scope: scope, profile: ""), "default profile binding authorized")
@@ -262,6 +287,7 @@ struct PasswordIntegrationChecks {
     check(!coordinator.status(folder: base.path, scope: scope, profile: ""), "other folder denied")
     let records = await coordinator.read(folder: folder.path, scope: scope, profile: "")
     check(records?.count == 1, "approved native password read succeeds")
+    check(store.cancellations > 0, "completed operations cancel outstanding native request handles")
     let bridgeJSON = try text(records!)
     check(!bridgeJSON.contains(password), "password record bridge never returns plaintext")
     let plaintextApply = await coordinator.apply(folder: folder.path, scope: scope, profile: "", changes: [["key": key, "desired": legacy, "base": NSNull()]])
@@ -272,7 +298,7 @@ struct PasswordIntegrationChecks {
     let applied = await coordinator.apply(folder: folder.path, scope: scope, profile: "", changes: [["key": key, "desired": value, "base": value]])
     check(applied, "authorized opaque apply verifies settled state")
     let updatedPassword = "updated-fixture-password"
-    let updatedLogin = PasswordSyncLogin(origin: "https://example.test", username: "fixture", password: updatedPassword, created: nil)
+    let updatedLogin = PasswordSyncLogin(origin: "https://example.test", username: "fixture", password: updatedPassword, created: 1_234_567_890_123)
     let updateBinding = PasswordSyncBinding(chain: keys.chainTag, folder: folder.path, scope: scope, profile: "")
     let updatedValue = try PasswordSyncRecords(keys: keys).seal(updatedLogin, key: key, binding: updateBinding).json
     let writesBeforeUpdate = store.writes
@@ -280,6 +306,27 @@ struct PasswordIntegrationChecks {
     check(updated && store.writes == writesBeforeUpdate + 1, "opaque password update reaches fixture store")
     check(store.logins.first?.password == updatedPassword, "opaque password update changes the stored secret")
     check(store.logins.first?.created == 0, "opaque password update preserves native epoch creation date")
+    for (index, created) in ([nil, 0, 1_234_567_890_123.5] as [Double?]).enumerated() {
+      let source = PasswordRecords.Credentials(origin: "https://example.test", username: "date-fixture-\(index)", password: password, created: created)
+      let sourceValue = try codec.seal(source, scope: scope, recordKey: source.recordKey)
+      let sourceLog: [String: Any] = ["v": 1, "kind": "log", "device": "source-device", "seq": 1, "at": 123,
+                                      "ops": [["k": source.recordKey, "h": "1:0:source-device", "v": sourceValue.json]]]
+      let wire = try payloads.write(scope: scope, payload: text(sourceLog))
+      let received = try payloads.read(scope: scope, payload: wire)
+      check(!received.contains(password), "incoming creation metadata stays sealed before JS")
+      let receivedLog = try JSONSerialization.jsonObject(with: Data(received.utf8)) as! [String: Any]
+      let receivedValue = (receivedLog["ops"] as! [[String: Any]])[0]["v"]!
+      let inserted = await coordinator.apply(folder: folder.path, scope: scope, profile: "",
+                                             changes: [["key": source.recordKey, "desired": receivedValue, "base": NSNull()]])
+      check(inserted, "outgoing/incoming wire reaches fixture native insertion")
+      let stored = store.logins.first { $0.key == source.recordKey }
+      check(stored?.password == password && stored?.created == created, "fixture insertion preserves authenticated source creation date")
+      let reread = await coordinator.read(folder: folder.path, scope: scope, profile: "")
+      let rereadRow = reread!.first { $0["key"] as? String == source.recordKey }!
+      let reopenedValue = try codec.value(from: rereadRow["value"]!, scope: scope, recordKey: source.recordKey)
+      let reopenedCredential = try codec.open(reopenedValue, scope: scope, recordKey: source.recordKey)
+      check(reopenedCredential.created == created, "inserted source creation survives native read and seal")
+    }
     for profile in ["incognito:window@profile", "../profile", "a/b", "a\\b", ".", ".."] {
       check(!PasswordSyncCoordinator.valid(scope: scope, profile: profile), "invalid engine profile rejected")
     }
@@ -290,14 +337,17 @@ struct PasswordIntegrationChecks {
     let invalidationsBeforeGenerationChange = invalidations
     generation += 1
     check(!coordinator.status(folder: folder.path, scope: scope, profile: ""), "key generation changes invalidate approval synchronously")
+    check(!store.nativeAuthorized && store.revocations > 0, "key invalidation synchronously revokes native authorization")
     check(auth.calls == 1 && invalidations == invalidationsBeforeGenerationChange + 1, "generation revokes once without silently reauthorizing")
     let reauthorized = await coordinator.authorize(folder: folder.path, profiles: profiles)
     check(reauthorized && auth.calls == 2, "explicit reauthorization succeeds")
+    check(store.authorizationGenerations.last == generation, "reauthorization binds the new key generation instead of a stale context")
     store.deferRead = true
     let pendingRead = Task { await coordinator.read(folder: folder.path, scope: scope, profile: "") }
     for _ in 0..<100 where store.pending == nil { await Task.yield() }
     check(store.pending != nil, "native read reached injected async boundary")
     coordinator.revoke()
+    check(!store.nativeAuthorized, "explicit revocation reaches native lease before late callback")
     store.pending?(store.logins)
     let revokedRead = await pendingRead.value
     check(revokedRead == nil, "late native password callback cannot cross revoked grant")
@@ -322,6 +372,21 @@ struct PasswordIntegrationChecks {
     check(finalAuthorization, "final fixture consent succeeds")
     now += 24 * 60 * 60
     check(!coordinator.status(folder: folder.path, scope: scope, profile: ""), "password session has a twenty-four-hour upper bound")
+    check(!store.nativeAuthorized, "expiry revokes the native authorization instead of only the JS-facing flag")
+    let refusingStore = FixturePasswordStore()
+    refusingStore.rejectAuthorization = true
+    let refusingCoordinator = PasswordSyncCoordinator(store: refusingStore, authentication: FixtureAuthentication(),
+      snapshot: { PasswordSyncKeySnapshot(keys: keys, generation: generation) }, foreground: { true }, now: { now },
+      observeSystem: false, onInvalidate: {})
+    let refused = await refusingCoordinator.authorize(folder: folder.path, profiles: profiles)
+    check(!refused && !refusingStore.nativeAuthorized && !refusingCoordinator.status(folder: folder.path, scope: scope, profile: ""), "rejected native lease cannot leave a live coordinator grant")
+    let expiredStore = FixturePasswordStore()
+    var clockReads = 0
+    let expiredCoordinator = PasswordSyncCoordinator(store: expiredStore, authentication: FixtureAuthentication(),
+      snapshot: { PasswordSyncKeySnapshot(keys: keys, generation: generation) }, foreground: { true },
+      now: { clockReads += 1; return clockReads == 1 ? 100 : 100 + 24 * 60 * 60 }, observeSystem: false, onInvalidate: {})
+    let expired = await expiredCoordinator.authorize(folder: folder.path, profiles: profiles)
+    check(!expired && expiredStore.authorizationDeadlines.isEmpty && !expiredStore.nativeAuthorized, "a known-expired device-owner grant never calls native lease construction")
     print("PASS: \(checks) production password bridge/coordinator assertions; hypothetical conditional-mutation store, not Chromium; isolated sync folder only")
   }
 }

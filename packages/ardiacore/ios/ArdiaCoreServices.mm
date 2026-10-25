@@ -173,20 +173,22 @@ NSString *StoreFolder(NSString *profile, NSString *extensionId, id version) {
   [self call:@"ac_passwords_remove" profile:profile args:Login(origin, username) completion:completion];
 }
 
-+ (void)passwordsForSync:(NSString *)profile authorized:(BOOL (^)(void))authorized
++ (void)passwordsForSync:(NSString *)profile request:(ArdiaCorePasswordSyncRequest *)request authorized:(BOOL (^)(void))authorized
             completion:(void (^)(NSArray<NSDictionary<NSString *, id> *> *))completion {
-  [ArdiaCoreEngineBridge readPasswordsForSync:profile authorized:authorized completion:completion];
+  [ArdiaCoreEngineBridge readPasswordsForSync:profile request:request authorized:authorized completion:completion];
 }
 
 + (void)compareAndSetPasswordForSync:(NSString *)profile origin:(NSString *)origin username:(NSString *)username
                   expectedPassword:(NSString *)expectedPassword desiredPassword:(NSString *)desiredPassword
-                        authorized:(BOOL (^)(void))authorized completion:(void (^)(BOOL))completion {
+                    desiredCreated:(NSNumber *)desiredCreated request:(ArdiaCorePasswordSyncRequest *)request
+                        authorized:(BOOL (^)(void))authorized completion:(void (^)(ArdiaCorePasswordSyncStatus))completion {
   NSDictionary *args = @{@"origin" : origin, @"username" : username,
-                         @"expectedPresent" : @(expectedPassword != nil), @"desiredPresent" : @(desiredPassword != nil)};
+                         @"expectedPresent" : @(expectedPassword != nil), @"desiredPresent" : @(desiredPassword != nil),
+                         @"desiredCreated" : desiredCreated ?: NSNull.null};
   NSMutableDictionary<NSString *, NSString *> *secrets = [NSMutableDictionary dictionary];
   if (expectedPassword) secrets[@"expectedPassword"] = expectedPassword;
   if (desiredPassword) secrets[@"desiredPassword"] = desiredPassword;
-  [ArdiaCoreEngineBridge compareAndSetPasswordForSync:profile args:WithSecrets(args, secrets) authorized:authorized completion:completion];
+  [ArdiaCoreEngineBridge compareAndSetPasswordForSync:profile args:WithSecrets(args, secrets) request:request authorized:authorized completion:completion];
 }
 
 + (void)neverSaveOrigins:(NSString *)profile completion:(ArdiaCoreResult)completion {

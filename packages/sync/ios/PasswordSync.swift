@@ -59,10 +59,17 @@ struct PasswordSyncAccess {
 }
 
 @MainActor
+protocol PasswordSyncStoreLifecycle {
+  func beginAuthorization(profiles: [String], expiresAt: TimeInterval, generation: UInt64) -> Bool
+  func revokeAuthorization()
+  func cancelPendingRequests()
+}
+
+@MainActor
 protocol PasswordSyncStore {
-  func read(profile: String, authorized: @escaping () -> Bool, completion: @escaping ([PasswordSyncLogin]?) -> Void)
+  func read(profile: String, expiresAt: TimeInterval, authorized: @escaping () -> Bool, completion: @escaping ([PasswordSyncLogin]?) -> Void)
   func compareAndSet(profile: String, key: String, expected: PasswordSyncLogin?, desired: PasswordSyncLogin?,
-                     authorized: @escaping () -> Bool, completion: @escaping (Bool?) -> Void)
+                     expiresAt: TimeInterval, authorized: @escaping () -> Bool, completion: @escaping (Bool?) -> Void)
 }
 
 @MainActor
@@ -85,7 +92,7 @@ final class PasswordSync {
 
   func read(_ binding: PasswordSyncBinding) async -> [[String: Any]]? {
     guard let operation = begin(binding) else { return nil }
-    defer { operation.active = false; busy = false }
+    defer { finish(operation) }
     guard let logins = await snapshot(operation), operation.authorized() else { return nil }
     do {
       var records: [[String: Any]] = []
@@ -100,7 +107,7 @@ final class PasswordSync {
 
   func apply(_ binding: PasswordSyncBinding, changes: [[String: Any]]) async -> Bool {
     guard let operation = begin(binding) else { return false }
-    defer { operation.active = false; busy = false }
+    defer { finish(operation) }
     let decoded: [(key: String, desired: PasswordSyncLogin?, base: PasswordSyncLogin?)]
     do {
       var seen = Set<Data>()
@@ -118,7 +125,7 @@ final class PasswordSync {
       guard same(have, change.base), operation.authorized() else { return false }
       let applied: Bool? = await call(operation) { authorized, completion in
         self.store.compareAndSet(profile: binding.profile, key: change.key, expected: have, desired: change.desired,
-                                 authorized: authorized, completion: completion)
+                                 expiresAt: operation.deadline, authorized: authorized, completion: completion)
       }
       guard applied == true, operation.authorized() else { return false }
     }
@@ -135,6 +142,12 @@ final class PasswordSync {
 
   private enum Invalid: Error { case record }
 
+  private func finish(_ operation: Operation) {
+    operation.active = false
+    (store as? any PasswordSyncStoreLifecycle)?.cancelPendingRequests()
+    busy = false
+  }
+
   private func begin(_ binding: PasswordSyncBinding) -> Operation? {
     guard !busy, !binding.chain.isEmpty, !binding.folder.isEmpty, !binding.scope.isEmpty,
           !binding.profile.contains("/"), !binding.profile.contains("\\"), !binding.profile.hasPrefix("incognito:"),
@@ -146,7 +159,7 @@ final class PasswordSync {
   private func open(_ value: Any, key: String, operation: Operation) throws -> PasswordSyncLogin? {
     if value is NSNull {
       let parts = key.dropFirst(3).split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
-      guard parts.count == 2, PasswordSyncLogin(origin: String(parts[0]), username: String(parts[1]), password: "", created: 0).key?.utf8.elementsEqual(key.utf8) == true else { throw Invalid.record }
+      guard parts.count == 2, PasswordSyncLogin(origin: String(parts[0]), username: String(parts[1]), password: "", created: nil).key?.utf8.elementsEqual(key.utf8) == true else { throw Invalid.record }
       return nil
     }
     guard let envelope = PasswordSyncEnvelope(value), operation.authorized() else { throw Invalid.record }
@@ -163,7 +176,7 @@ final class PasswordSync {
 
   private func snapshot(_ operation: Operation) async -> [Data: PasswordSyncLogin]? {
     let rows: [PasswordSyncLogin]? = await call(operation) { authorized, completion in
-      self.store.read(profile: operation.access.binding.profile, authorized: authorized, completion: completion)
+      self.store.read(profile: operation.access.binding.profile, expiresAt: operation.deadline, authorized: authorized, completion: completion)
     }
     guard let rows, operation.authorized() else { return nil }
     var result: [Data: PasswordSyncLogin] = [:]
@@ -179,7 +192,9 @@ final class PasswordSync {
   private func call<T>(_ operation: Operation, _ body: (@escaping () -> Bool, @escaping (T?) -> Void) -> Void) async -> T? {
     guard operation.authorized() else { return nil }
     return await withCheckedContinuation { continuation in
-      let request = Request(continuation: continuation, operation: operation)
+      let request = Request(continuation: continuation, operation: operation) {
+        (self.store as? any PasswordSyncStoreLifecycle)?.cancelPendingRequests()
+      }
       DispatchQueue.main.asyncAfter(deadline: .now() + max(0, operation.deadline - ProcessInfo.processInfo.systemUptime)) {
         request.finish(nil)
       }
@@ -207,16 +222,19 @@ final class PasswordSync {
   private final class Request<T> {
     private var continuation: CheckedContinuation<T?, Never>?
     private let operation: Operation
+    private let cancel: () -> Void
     var pending: Bool { continuation != nil }
 
-    init(continuation: CheckedContinuation<T?, Never>, operation: Operation) {
+    init(continuation: CheckedContinuation<T?, Never>, operation: Operation, cancel: @escaping () -> Void) {
       self.continuation = continuation
       self.operation = operation
+      self.cancel = cancel
     }
 
     func finish(_ value: T?) {
       guard let continuation else { return }
       self.continuation = nil
+      cancel()
       continuation.resume(returning: operation.authorized() ? value : nil)
     }
   }

@@ -27,6 +27,14 @@ typedef void (*ac_engine_set_event_sink_t)(ac_engine_event_t sink,
                                            void* context);
 
 typedef int (*ac_passwords_sync_authorized_t)(void* context);
+typedef int (*ac_passwords_sync_begin_commit_t)(void* context);
+typedef void (*ac_passwords_sync_end_commit_t)(void* context, int committed);
+typedef enum {
+  AC_PASSWORDS_SYNC_UNAUTHORIZED = -2,
+  AC_PASSWORDS_SYNC_ERROR = -1,
+  AC_PASSWORDS_SYNC_CONFLICT = 0,
+  AC_PASSWORDS_SYNC_COMMITTED = 1
+} ac_passwords_sync_status;
 typedef struct {
   const char* origin;
   size_t origin_size;
@@ -39,7 +47,7 @@ typedef struct {
 } ac_passwords_sync_login;
 typedef void (*ac_passwords_sync_login_t)(void* context,
                                          const ac_passwords_sync_login* login);
-typedef void (*ac_passwords_sync_done_t)(void* context, int success);
+typedef void (*ac_passwords_sync_done_t)(void* context, int status);
 typedef void (*ac_passwords_sync_read_t)(
     const char* profile_dir,
     ac_passwords_sync_authorized_t authorized,
@@ -50,6 +58,14 @@ typedef void (*ac_passwords_sync_compare_and_set_t)(
     const char* profile_dir,
     const char* args_json,
     ac_passwords_sync_authorized_t authorized,
+    ac_passwords_sync_done_t done,
+    void* context);
+typedef void (*ac_passwords_sync_compare_and_set_v2_t)(
+    const char* profile_dir,
+    const char* args_json,
+    ac_passwords_sync_authorized_t authorized,
+    ac_passwords_sync_begin_commit_t begin_commit,
+    ac_passwords_sync_end_commit_t end_commit,
     ac_passwords_sync_done_t done,
     void* context);
 
@@ -63,6 +79,14 @@ AC_ENGINE_EXPORT void ac_passwords_sync_compare_and_set(
     const char* profile_dir,
     const char* args_json,
     ac_passwords_sync_authorized_t authorized,
+    ac_passwords_sync_done_t done,
+    void* context);
+AC_ENGINE_EXPORT void ac_passwords_sync_compare_and_set_v2(
+    const char* profile_dir,
+    const char* args_json,
+    ac_passwords_sync_authorized_t authorized,
+    ac_passwords_sync_begin_commit_t begin_commit,
+    ac_passwords_sync_end_commit_t end_commit,
     ac_passwords_sync_done_t done,
     void* context);
 

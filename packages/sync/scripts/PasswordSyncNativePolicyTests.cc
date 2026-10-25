@@ -3,9 +3,21 @@
 
 #include <cassert>
 #include <cstdio>
+#include <type_traits>
 #include <vector>
 
-#include "password_sync_mutation_endpoint.inc"
+static_assert(AC_PASSWORDS_SYNC_COMMITTED == 1);
+static_assert(AC_PASSWORDS_SYNC_CONFLICT == 0);
+static_assert(AC_PASSWORDS_SYNC_ERROR == -1);
+static_assert(AC_PASSWORDS_SYNC_UNAUTHORIZED == -2);
+static_assert(std::is_same_v<decltype(&ac_passwords_sync_read), ac_passwords_sync_read_t>);
+static_assert(std::is_same_v<decltype(&ac_passwords_sync_compare_and_set), ac_passwords_sync_compare_and_set_t>);
+static_assert(std::is_same_v<decltype(&ac_passwords_sync_compare_and_set_v2), ac_passwords_sync_compare_and_set_v2_t>);
+static_assert(std::is_same_v<ac_passwords_sync_compare_and_set_t,
+                           void (*)(const char*, const char*, ac_passwords_sync_authorized_t,
+                                    ac_passwords_sync_done_t, void*)>);
+static_assert(std::is_same_v<ac_passwords_sync_begin_commit_t, int (*)(void*)>);
+static_assert(std::is_same_v<ac_passwords_sync_end_commit_t, void (*)(void*, int)>);
 
 struct Credential {
   std::u16string username;
@@ -17,23 +29,6 @@ bool Supported(const std::vector<Credential>& credentials) {
   return ardia::SyncSnapshotSupported(
       credentials, [](const auto& credential) { return credential.syncable; },
       [](const auto& credential) { return credential.origins; });
-}
-
-struct Completion {
-  int count = 0;
-  int success = -1;
-  int authorized_count = 0;
-};
-
-int Authorized(void* context) {
-  ++static_cast<Completion*>(context)->authorized_count;
-  return 1;
-}
-
-void Done(void* context, int success) {
-  auto& completion = *static_cast<Completion*>(context);
-  ++completion.count;
-  completion.success = success;
 }
 
 int main() {
@@ -63,26 +58,5 @@ int main() {
   assert(!Supported({first, {u"fixture", {"https://fixture.example#fragment"}}}));
   assert(!Supported({first, {u"fixture", {"https://\xc3\xa9.example"}}}));
 
-  const char* cases[] = {
-      R"({"origin":"https://first.example","username":"fixture","expectedPresent":false,"desiredPresent":true,"expectedPassword":null,"desiredPassword":"test"})",
-      R"({"origin":"https://first.example","username":"fixture","expectedPresent":true,"desiredPresent":true,"expectedPassword":"old","desiredPassword":"new"})",
-      R"({"origin":"https://first.example","username":"fixture","expectedPresent":true,"desiredPresent":false,"expectedPassword":"old","desiredPassword":null})",
-      R"({"origin":"https://first.example","username":"fixture","expectedPresent":true,"desiredPresent":true,"expectedPassword":"test","desiredPassword":"test"})",
-      R"({"origin":"https://first.example","username":"fixture","expectedPresent":false,"desiredPresent":false,"expectedPassword":null,"desiredPassword":null})",
-      "{}",
-      nullptr,
-      reinterpret_cast<const char*>(1)};
-  for (const char* args : cases) {
-    Completion completion;
-    ac_passwords_sync_compare_and_set(reinterpret_cast<const char*>(1), args,
-                                      Authorized, Done, &completion);
-    assert(completion.count == 1);
-    assert(completion.success == 0);
-    assert(completion.authorized_count == 0);
-  }
-  Completion completion;
-  ac_passwords_sync_compare_and_set(nullptr, nullptr, nullptr, Done, &completion);
-  assert(completion.count == 1 && completion.success == 0);
-  ac_passwords_sync_compare_and_set(nullptr, nullptr, nullptr, nullptr, nullptr);
-  puts("Production snapshot policy: 22 cases; extracted native mutation endpoint: 10 refusals/null completion cases passed without store dependencies");
+  puts("Production snapshot policy: 22 cases; typed conditional-mutation ABI: 10 compile-time checks; Chromium DB transaction requires its native store test target");
 }

@@ -7,18 +7,25 @@ public struct PasswordRecords {
     public let origin: String
     public let username: String
     public let password: String
+    public let created: Double?
 
-    public init(origin: String, username: String, password: String) {
+    public init(origin: String, username: String, password: String, created: Double? = nil) {
       self.origin = origin
       self.username = username
       self.password = password
+      self.created = created
     }
 
     public var recordKey: String { "pw:" + origin + "\n" + username }
-    public var legacyValue: [String: Any] { ["o": origin, "u": username, "p": password] }
+    public var legacyValue: [String: Any] {
+      var value: [String: Any] = ["o": origin, "u": username, "p": password]
+      if let created { value["c"] = created }
+      return value
+    }
 
     public static func == (lhs: Credentials, rhs: Credentials) -> Bool {
-      lhs.origin.utf8.elementsEqual(rhs.origin.utf8) && lhs.username.utf8.elementsEqual(rhs.username.utf8) && lhs.password.utf8.elementsEqual(rhs.password.utf8)
+      lhs.origin.utf8.elementsEqual(rhs.origin.utf8) && lhs.username.utf8.elementsEqual(rhs.username.utf8)
+        && lhs.password.utf8.elementsEqual(rhs.password.utf8) && lhs.created == rhs.created
     }
   }
 
@@ -144,6 +151,9 @@ public struct PasswordRecords {
   }
 
   private func validate(_ credentials: Credentials, recordKey: String) throws {
+    if let created = credentials.created {
+      guard created.isFinite, abs(created) <= 8_640_000_000_000_000 else { throw Failure.format }
+    }
     guard !credentials.origin.isEmpty, !credentials.origin.contains("\n"),
           credentials.origin.utf8.count + credentials.username.utf8.count + credentials.password.utf8.count <= Self.maximumCredentialBytes,
           credentials.recordKey.utf8.elementsEqual(recordKey.utf8) else { throw Failure.format }
@@ -169,9 +179,17 @@ public struct PasswordRecords {
 
   private func credentials(_ json: Any, recordKey: String) throws -> Credentials {
     let object = try Self.object(json)
-    guard Set(object.keys) == ["o", "u", "p"], let origin = object["o"] as? String,
+    let fields = Set(object.keys)
+    let legacyFields: Set<String> = ["o", "u", "p"]
+    let datedFields: Set<String> = ["o", "u", "p", "c"]
+    guard fields == legacyFields || fields == datedFields, let origin = object["o"] as? String,
           let username = object["u"] as? String, let password = object["p"] as? String else { throw Failure.format }
-    let credentials = Credentials(origin: origin, username: username, password: password)
+    let created: Double?
+    if let value = object["c"], !(value is NSNull) {
+      guard Self.isNumber(value), let number = value as? NSNumber else { throw Failure.format }
+      created = number.doubleValue
+    } else { created = nil }
+    let credentials = Credentials(origin: origin, username: username, password: password, created: created)
     try validate(credentials, recordKey: recordKey)
     return credentials
   }

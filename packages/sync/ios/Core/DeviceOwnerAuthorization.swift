@@ -3,20 +3,32 @@ import LocalAuthentication
 
 protocol DeviceOwnerAuthenticating: AnyObject {
   func evaluate(reason: String, completion: @escaping (Bool) -> Void)
+  func evaluateGrant(reason: String, completion: @escaping (Bool, TimeInterval?) -> Void)
   func cancel()
+}
+
+extension DeviceOwnerAuthenticating {
+  func evaluateGrant(reason: String, completion: @escaping (Bool, TimeInterval?) -> Void) {
+    evaluate(reason: reason) { completion($0, nil) }
+  }
 }
 
 final class LocalDeviceOwnerAuthentication: DeviceOwnerAuthenticating {
   private var context: LAContext?
 
   func evaluate(reason: String, completion: @escaping (Bool) -> Void) {
-    guard ProcessInfo.processInfo.environment["ARDIA_BACKGROUND"] != "1" else { return completion(false) }
+    evaluateGrant(reason: reason) { allowed, _ in completion(allowed) }
+  }
+
+  func evaluateGrant(reason: String, completion: @escaping (Bool, TimeInterval?) -> Void) {
+    guard ProcessInfo.processInfo.environment["ARDIA_BACKGROUND"] != "1" else { return completion(false, nil) }
     let context = LAContext()
     self.context = context
     var error: NSError?
-    guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else { return completion(false) }
+    guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else { return completion(false, nil) }
     context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { allowed, _ in
-      DispatchQueue.main.async { completion(allowed) }
+      let grantedAt = allowed ? ProcessInfo.processInfo.systemUptime : nil
+      DispatchQueue.main.async { completion(allowed, grantedAt) }
     }
   }
 
@@ -32,6 +44,7 @@ final class DeviceOwnerAuthorization {
     fileprivate let owner: UUID
     fileprivate let generation: UInt64
     fileprivate let binding: String
+    let expiresAt: TimeInterval
   }
 
   private let authentication: DeviceOwnerAuthenticating
@@ -83,17 +96,19 @@ final class DeviceOwnerAuthorization {
     guard !pending, currentBinding() == binding else { return completion(nil) }
     let request = generation
     pending = true
-    authentication.evaluate(reason: reason) { [weak self] allowed in
+    authentication.evaluateGrant(reason: reason) { [weak self] allowed, grantedAt in
       guard let self else { return completion(nil) }
       guard self.generation == request else { return completion(nil) }
       self.pending = false
       guard allowed, currentBinding() == binding else { return completion(nil) }
-      let grant = Grant(owner: self.owner, generation: request, binding: binding)
+      let expiresAt = (grantedAt ?? self.now()) + self.lifetime
+      guard self.now() < expiresAt else { return completion(nil) }
+      let grant = Grant(owner: self.owner, generation: request, binding: binding, expiresAt: expiresAt)
       self.grant = grant
-      self.deadline = self.now() + self.lifetime
+      self.deadline = grant.expiresAt
       let expiry = DispatchWorkItem { [weak self] in self?.revoke(.expired) }
       self.expiry = expiry
-      DispatchQueue.main.asyncAfter(deadline: .now() + self.lifetime, execute: expiry)
+      DispatchQueue.main.asyncAfter(deadline: .now() + max(0, expiresAt - self.now()), execute: expiry)
       completion(grant)
     }
   }

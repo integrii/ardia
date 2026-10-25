@@ -778,3 +778,16 @@ extern "C" AC_ENGINE_EXPORT void ac_passwords_sync_compare_and_set(
     done(context, 0);
   }
 }
+
+extern "C" AC_ENGINE_EXPORT void ac_passwords_sync_compare_and_set_v2(
+    const char*,
+    const char*,
+    ac_passwords_sync_authorized_t,
+    ac_passwords_sync_begin_commit_t,
+    ac_passwords_sync_end_commit_t,
+    ac_passwords_sync_done_t done,
+    void* context) {
+  if (done) {
+    done(context, AC_PASSWORDS_SYNC_ERROR);
+  }
+}

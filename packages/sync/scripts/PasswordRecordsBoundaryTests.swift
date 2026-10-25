@@ -58,6 +58,69 @@ struct PasswordRecordsBoundaryTests {
     }
   }
 
+  private static func creationDates(core: PasswordRecords, scope: String, login: PasswordRecords.Credentials) throws {
+    let key = login.recordKey
+    let original = try core.seal(login, scope: scope, recordKey: key)
+    for created: Double? in [nil, 0, 1_234_567_890_123.5, -1, -8_640_000_000_000_000, 8_640_000_000_000_000] {
+      let dated = PasswordRecords.Credentials(origin: login.origin, username: login.username, password: login.password, created: created)
+      let value = try core.seal(dated, scope: scope, recordKey: key)
+      let opened = try core.open(value, scope: scope, recordKey: key)
+      try check(opened.created == created, "creation milliseconds survive authenticated envelope")
+      try check(opened == dated, "credential equality includes creation metadata")
+      try check(value.fingerprint == original.fingerprint, "creation metadata does not change edit identity")
+      try check(Set(dated.legacyValue.keys) == (created == nil ? ["o", "u", "p"] : ["o", "u", "p", "c"]), "unknown creation retains three-field legacy shape")
+      let wire: [String: Any] = ["v": 1, "kind": "log", "device": "fixture", "seq": 1, "at": 1000,
+                                  "ops": [["k": key, "h": "clock", "v": value.json]]]
+      let outbound = try core.outboundLegacyWire(scope: scope, payload: encode(wire))
+      let inbound = try object(core.transformWire(scope: scope, payload: outbound))
+      let restored = (inbound["ops"] as! [[String: Any]])[0]["v"]!
+      let restoredValue = try core.value(from: restored, scope: scope, recordKey: key)
+      try check(core.open(restoredValue, scope: scope, recordKey: key).created == created, "outgoing and incoming wire preserve source creation")
+      try noSecret(encode(inbound))
+      try noPasswordFields(encode(inbound))
+      let local: [String: Any] = ["records": [key: ["h": "clock", "o": ["fixture", 1], "v": dated.legacyValue]],
+                                 "base": [key: String(decoding: try encode(dated.legacyValue), as: UTF8.self)], "outbox": [],
+                                 "applyProvenance": [key: [dated.legacyValue]]]
+      let migrated = try object(core.transformLocal(scope: scope, payload: encode(local)))
+      let record = (migrated["records"] as! [String: [String: Any]])[key]!["v"]!
+      let base = try JSONSerialization.jsonObject(with: Data((migrated["base"] as! [String: String])[key]!.utf8))
+      let provenance = (migrated["applyProvenance"] as! [String: [Any]])[key]![0]
+      for slot in [record, base, provenance] {
+        let sealed = try core.value(from: slot, scope: scope, recordKey: key)
+        try check(core.open(sealed, scope: scope, recordKey: key).created == created, "creation metadata survives local state slots")
+      }
+    }
+    func incoming(_ created: Any, extra: Bool = false) throws -> Data {
+      var raw = login.legacyValue
+      raw["c"] = created
+      if extra { raw["extra"] = 1 }
+      return try encode(["v": 1, "kind": "log", "device": "fixture", "seq": 1, "at": 1000,
+                         "ops": [["k": key, "h": "clock", "v": raw]]])
+    }
+    let nullIncoming = try object(core.transformWire(scope: scope, payload: incoming(NSNull())))
+    let nullValue = try core.value(from: (nullIncoming["ops"] as! [[String: Any]])[0]["v"]!, scope: scope, recordKey: key)
+    try check(core.open(nullValue, scope: scope, recordKey: key).created == nil, "explicit null creation stays unknown")
+    for bad: Any in [true, false, "0", [], ["ms": 0], 8_640_000_000_000_001.0, -8_640_000_000_000_001.0] {
+      try rejects("invalid creation metadata") { _ = try core.transformWire(scope: scope, payload: incoming(bad)) }
+    }
+    try rejects("unknown credential metadata") { _ = try core.transformWire(scope: scope, payload: incoming(0, extra: true)) }
+    for bad in [Double.nan, Double.infinity, -Double.infinity, 8_640_000_000_000_001.0, -8_640_000_000_000_001.0] {
+      let invalid = PasswordRecords.Credentials(origin: login.origin, username: login.username, password: login.password, created: bad)
+      try rejects("invalid native creation time") { _ = try core.seal(invalid, scope: scope, recordKey: key) }
+    }
+    let dated = PasswordRecords.Credentials(origin: login.origin, username: login.username, password: login.password, created: 1_234_567_890_123)
+    let authenticated = try core.seal(dated, scope: scope, recordKey: key)
+    let plain = try encode(dated.legacyValue)
+    guard let dateBytes = plain.range(of: Data("1234567890123".utf8)), var bytes = Data(base64Encoded: authenticated.sealed) else { throw Failure.assertion("creation tamper fixture") }
+    bytes[12 + dateBytes.lowerBound] ^= 1
+    try rejects("creation ciphertext tampering despite unchanged edit fingerprint") {
+      _ = try core.open(.init(sealed: bytes.base64EncodedString(), fingerprint: authenticated.fingerprint), scope: scope, recordKey: key)
+    }
+    var untrusted = authenticated.json
+    untrusted["c"] = 9
+    try rejects("JS cannot override sealed creation time") { _ = try core.value(from: untrusted, scope: scope, recordKey: key) }
+  }
+
   private static func run() throws {
     let keys = SyncKeys(entropy: Data(repeating: 41, count: 32))
     let core = PasswordRecords(keys: keys)
@@ -69,6 +132,7 @@ struct PasswordRecordsBoundaryTests {
     try check(first.sealed != second.sealed, "random nonces")
     try check(first.fingerprint == second.fingerprint, "stable fingerprints")
     try check(core.open(first, scope: scope, recordKey: key) == login, "authenticated roundtrip")
+    try creationDates(core: core, scope: scope, login: login)
     try localStateDecodeBounds(keys: keys)
     let plaintext = try encode(["p": "untracked-fixture"])
     let escapedPlaintext = try encode(["base": [key: String(decoding: plaintext, as: UTF8.self)]])

@@ -4,6 +4,35 @@ NS_ASSUME_NONNULL_BEGIN
 
 typedef void (^ArdiaCoreResult)(NSDictionary<NSString *, id> *result);
 
+typedef NS_ENUM(NSInteger, ArdiaCorePasswordSyncStatus) {
+  ArdiaCorePasswordSyncStatusUnauthorized = -2,
+  ArdiaCorePasswordSyncStatusError = -1,
+  ArdiaCorePasswordSyncStatusConflict = 0,
+  ArdiaCorePasswordSyncStatusCommitted = 1
+};
+
+@interface ArdiaCorePasswordSyncRequest : NSObject
+- (instancetype)init NS_UNAVAILABLE;
++ (instancetype)new NS_UNAVAILABLE;
+- (void)cancel;
+@end
+
+@interface ArdiaCorePasswordSyncKeyState : NSObject
+- (void)replaceGeneration:(uint64_t)generation NS_SWIFT_NAME(replaceGeneration(_:));
+- (void)invalidate;
+@end
+
+@interface ArdiaCorePasswordSyncAuthorization : NSObject
+- (instancetype)init NS_UNAVAILABLE;
++ (instancetype)new NS_UNAVAILABLE;
+- (nullable instancetype)initWithProfiles:(NSArray<NSString *> *)profiles expiresAt:(NSTimeInterval)expiresAt
+                               keyState:(ArdiaCorePasswordSyncKeyState *)keyState generation:(uint64_t)generation
+    NS_SWIFT_NAME(init(profiles:expiresAt:keyState:generation:));
+- (nullable ArdiaCorePasswordSyncRequest *)requestForProfile:(NSString *)profile expiresAt:(NSTimeInterval)expiresAt
+    NS_SWIFT_NAME(request(profile:expiresAt:));
+- (void)revoke;
+@end
+
 @interface ArdiaCoreServices : NSObject
 
 + (void)call:(NSString *)name
@@ -27,13 +56,14 @@ typedef void (^ArdiaCoreResult)(NSDictionary<NSString *, id> *result);
     NS_SWIFT_NAME(allowSaving(profile:origin:completion:));
 + (void)exportPasswords:(NSString *)profile path:(nullable NSString *)path completion:(ArdiaCoreResult)completion
     NS_SWIFT_NAME(exportPasswords(profile:path:completion:));
-+ (void)passwordsForSync:(NSString *)profile authorized:(BOOL (^)(void))authorized
++ (void)passwordsForSync:(NSString *)profile request:(ArdiaCorePasswordSyncRequest *)request authorized:(BOOL (^)(void))authorized
             completion:(void (^)(NSArray<NSDictionary<NSString *, id> *> *_Nullable logins))completion
-    NS_SWIFT_NAME(passwordsForSync(profile:authorized:completion:));
+    NS_SWIFT_NAME(passwordsForSync(profile:request:authorized:completion:));
 + (void)compareAndSetPasswordForSync:(NSString *)profile origin:(NSString *)origin username:(NSString *)username
                   expectedPassword:(nullable NSString *)expectedPassword desiredPassword:(nullable NSString *)desiredPassword
-                        authorized:(BOOL (^)(void))authorized completion:(void (^)(BOOL success))completion
-    NS_SWIFT_NAME(compareAndSetPasswordForSync(profile:origin:username:expectedPassword:desiredPassword:authorized:completion:));
+                    desiredCreated:(nullable NSNumber *)desiredCreated request:(ArdiaCorePasswordSyncRequest *)request
+                        authorized:(BOOL (^)(void))authorized completion:(void (^)(ArdiaCorePasswordSyncStatus status))completion
+    NS_SWIFT_NAME(compareAndSetPasswordForSync(profile:origin:username:expectedPassword:desiredPassword:desiredCreated:request:authorized:completion:));
 
 + (BOOL)boolPreference:(NSString *)name profile:(NSString *)profile NS_SWIFT_NAME(boolPreference(_:profile:));
 + (void)setBoolPreference:(NSString *)name value:(BOOL)value profile:(NSString *)profile NS_SWIFT_NAME(setBoolPreference(_:value:profile:));

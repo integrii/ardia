@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 const { useBrowser } = await import("../store/browser.ts");
 const model = await import("../store/model.ts");
-const { Clock, emptyScope, syncScope } = await import("@ardia/sync");
+const { Clock, canonical, emptyScope, syncScope } = await import("@ardia/sync");
 const adapters = await import("./adapters.ts");
 const stub = await import("../test-native-stub.mjs");
 
@@ -1015,6 +1015,59 @@ for (const olderCreated of [1000, 0, null]) {
     assert.equal(stub.passwordStores.get(b.id).get(key.slice(3)).password, "newer-secret");
     assert.equal(parseInt(a.scopes.p.records[key].h.split(".")[0], 36), 2000);
     assert.equal((await b.sync()).published, 0);
+  });
+}
+
+for (const created of [0, null, 1_234_567_890_123.5]) {
+  test(`passwords: adapter forwards opaque creation metadata unchanged for ${created}`, async () => {
+    const key = "pw:https://bank.example\nalice";
+    const base = { version: 2, sealed: "authenticated-base", fingerprint: "base-fingerprint" };
+    const desired = { version: 2, sealed: "authenticated-incoming-with-source-date", fingerprint: "desired-fingerprint" };
+    const calls = [];
+    const adapter = adapters.passwordsAdapter("default", "p", "fixture", () => true, {
+      readPasswordRecords: async () => [{ key, value: base, created }],
+      applyPasswordRecords: async (...args) => (calls.push(args), true),
+    });
+    const extracted = await adapter.extract(() => undefined);
+    assert.equal(extracted.values.get(key), base);
+    assert.equal(adapter.editedAt(base), created ?? 0);
+    assert.equal(await adapter.apply(new Map([[key, desired]]), new Set([key]), () => base), true);
+    assert.deepEqual(calls[0][3], [{ key, desired, base }]);
+    assert.equal(calls[0][3][0].desired, desired);
+    assert.deepEqual(Object.keys(calls[0][3][0]).sort(), ["base", "desired", "key"]);
+  });
+}
+
+test("passwords: destination creation differences and fresh nonces retain the authenticated base without repeated edits", async () => {
+  const key = "pw:https://bank.example\nalice";
+  const base = { version: 2, sealed: "source-date-envelope", fingerprint: "stable-identity-password-fingerprint" };
+  let created = 987_654_321;
+  let reads = 0;
+  const adapter = adapters.passwordsAdapter("default", "p", "fixture", () => true, {
+    readPasswordRecords: async () => [{ key, value: { ...base, sealed: `destination-nonce-${++reads}` }, created }],
+    applyPasswordRecords: async () => true,
+  });
+  for (created of [987_654_321, 0, null, 123_456_789]) {
+    const extracted = await adapter.extract(() => base);
+    assert.equal(extracted.values.get(key), base);
+    assert.equal(adapter.editedAt(base), created ?? 0);
+    assert.equal(canonical(extracted.values.get(key)), canonical(base));
+  }
+  assert.equal(reads, 4);
+});
+
+for (const created of [true, false, "0", undefined, NaN, Infinity, -Infinity, 8_640_000_000_000_001, -8_640_000_000_000_001]) {
+  test(`passwords: malformed native creation metadata ${String(created)} fails closed before extract or apply`, async () => {
+    const key = "pw:https://bank.example\nalice";
+    const value = { version: 2, sealed: "authenticated-value", fingerprint: "fingerprint" };
+    let writes = 0;
+    const adapter = adapters.passwordsAdapter("default", "p", "fixture", () => true, {
+      readPasswordRecords: async () => [{ key, value, created }],
+      applyPasswordRecords: async () => (writes++, true),
+    });
+    assert.equal(await adapter.extract(() => undefined), null);
+    assert.equal(await adapter.apply(new Map([[key, value]]), new Set([key]), () => value), false);
+    assert.equal(writes, 0);
   });
 }
 

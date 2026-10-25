@@ -1,4 +1,5 @@
 import AppKit
+import ArdiaCore
 import ExpoModulesCore
 
 public class SyncModule: Module {
@@ -13,6 +14,7 @@ public class SyncModule: Module {
 
     OnDestroy { [weak self] in
       guard let self else { return }
+      self.state.passwordAuthorizationState.invalidate()
       DispatchQueue.main.async {
         self.passwordSyncDestroyed = true
         self.passwordSync?.revoke()
@@ -253,7 +255,7 @@ public class SyncModule: Module {
   @MainActor
   private func passwordCoordinator() -> PasswordSyncCoordinator {
     if let passwordSync { return passwordSync }
-    let coordinator = PasswordSyncCoordinator(store: ChromePasswordSyncStore(), snapshot: { [weak self] in
+    let coordinator = PasswordSyncCoordinator(store: ChromePasswordSyncStore(keyState: state.passwordAuthorizationState), snapshot: { [weak self] in
       self?.state.passwordSnapshot
     }, onInvalidate: { [weak self] in self?.sendEvent("onPasswordSyncInvalidated", [:]) })
     passwordSync = coordinator
@@ -315,17 +317,31 @@ public class SyncModule: Module {
 }
 
 private final class KeyState {
+  let passwordAuthorizationState: ArdiaCorePasswordSyncKeyState
   private let lock = NSLock()
+  private let mutationLock = NSLock()
   private var _entropy: Data?
   private var _keys: SyncKeys?
   private var passwordKeyGeneration: UInt64 = 0
 
+  init(passwordAuthorizationState: ArdiaCorePasswordSyncKeyState = ArdiaCorePasswordSyncKeyState()) {
+    self.passwordAuthorizationState = passwordAuthorizationState
+  }
+
+  deinit { passwordAuthorizationState.invalidate() }
+
   func set(_ entropy: Data?) {
+    mutationLock.lock()
+    defer { mutationLock.unlock() }
+    lock.lock()
+    let nextGeneration = passwordKeyGeneration &+ 1
+    lock.unlock()
+    passwordAuthorizationState.replaceGeneration(nextGeneration)
     lock.lock()
     defer { lock.unlock() }
     _entropy = entropy
     _keys = entropy.map(SyncKeys.init(entropy:))
-    passwordKeyGeneration &+= 1
+    passwordKeyGeneration = nextGeneration
   }
 
   var passwordSnapshot: PasswordSyncKeySnapshot? {
