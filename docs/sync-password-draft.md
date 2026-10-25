@@ -16,7 +16,7 @@ finish password import/sync or make this PR merge-ready. The existing Boolean AB
 distinguish unavailable from a database conflict; callers must not treat refusal as success.
 
 The candidate `chromium-password-sync-transaction.patch` adds a conditional store API and an
-outermost database transaction, plus twenty Chromium regression-test definitions. It cleanly
+outermost database transaction, plus twenty-four Chromium regression-test definitions. It cleanly
 applies to the pinned sources but has not been compiled or executed. The engine does not call
 it: the versioned seven-argument `ac_passwords_sync_compare_and_set_v2` also refuses all writes,
 with an explicit error status. Its distinct symbol avoids calling an older five-argument
@@ -132,7 +132,7 @@ Fresh main-session reruns of the transaction/lease continuation:
 | Swift bridge, store typecheck and substituted native bridge | Passed; 19 native and 12 generic-denial completions |
 | Native policy/lease/registry/compatibility suite | 11 passed, including ASan/UBSan and TSan |
 | Two timing-containing browser fixture files, run serially with published-head controls | 15 candidate tests and 15 control tests passed; not the app performance gate |
-| Candidate storage patch | Clean application and source review only; 20 Chromium gtest definitions not compiled or executed |
+| Candidate storage patch | Clean application and source review only; 57 pinned source hashes and 406 preceding entries checked; 24 Chromium gtest definitions not compiled or executed |
 | Full Chromium/native app/XCTest | No passing result; full build environment unavailable |
 
 The wider non-timing browser run hit its 150-second deadline without a final summary and

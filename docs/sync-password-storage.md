@@ -12,7 +12,7 @@ from helper-test results or source inspection alone.
 - Candidate: `engine/patches/chromium-password-sync-transaction.patch`.
 
 The patch was generated against the exact tagged Chromium files after the applicable Helium
-domain substitutions. Thirty-eight original file hashes and both downloaded Helium archives
+domain substitutions. Fifty-seven original file hashes and both downloaded Helium archives
 were checked. An audit of 406 preceding patch entries found no path overlaps with the candidate.
 Read-only `git apply --check` and a zero-fuzz application passed against reconstructed baselines.
 This checks source provenance and application, not C++ compilation, linking or runtime behavior.
@@ -33,6 +33,13 @@ Committed status is not changed by a later revocation. An admitted commit may fi
 expiry; synchronous revocation waits for it, and later queued requests cannot obtain permission
 after revocation returns. This is a commit-permission boundary, not a disk-write deadline.
 
+Sleep, session and screen-lock notifications currently invalidate authorization when their
+main-queue callbacks run. Revocation takes effect when that callback acquires the native
+authorization gate; an earlier admitted commit may finish. A blocked main queue can delay
+notification delivery. This is not a guarantee that no commit follows the physical instant
+of lock or sleep. Independently delivered event-receipt enforcement would require a verified
+native event source and separate lifetime/locking tests.
+
 Original monotonic grant expiry and the overall operation deadline constrain native requests.
 They are not renewed for each store call. Key replacement synchronously revokes registered
 leases before publishing its new generation. An actively tracking Chromium sync-metadata
@@ -47,15 +54,19 @@ must reject that exact known value. Older clients may strip optional creation me
 
 ## Tests added, not executed
 
-Twenty gtest definitions exercise the actual LoginDatabase or built-in backend, not a copied CAS
+Twenty-four gtest definitions exercise the actual LoginDatabase or built-in backend, not a copied CAS
 algorithm. They cover source dates, stale comparisons, absence and deletion, rollback, nested
 transactions, outer-commit refusal after a nested rollback marker, native permission denial,
 expiry and revocation, identity
 ambiguity, presenter notifications, a queued local write and backend shutdown.
 
-The rollback-marker test does not induce a failing SQLite `COMMIT` statement. Actual SQL commit
-failure, cryptographic failure and active-Chromium-sync refusal still need executable regressions.
-These definitions have not been compiled or run. Required runtime evidence includes queued
+The rollback-marker test does not induce a failing SQLite `COMMIT` statement. A separate new
+definition uses a deferred foreign-key violation on the actual database connection, requires
+the failing statement to be `COMMIT`, and checks rollback before native End. Other definitions
+exercise decrypt/encrypt failures with pinned OSCrypt test encryptors and tracked-sync refusal
+through the real database helper. A Python SQLite probe confirms only the deferred-constraint
+mechanism, not Chromium behavior. None of these definitions have been compiled or run.
+Required runtime evidence includes queued
 and committed-but-unnotified local edits, conditional insertion/update/deletion, commit failure,
 revocation/expiry, shutdown and callback-context survival until every queued borrower drains.
 
