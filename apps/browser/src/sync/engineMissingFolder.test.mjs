@@ -19,6 +19,7 @@ let ids = 0;
 let chainStatus = "ok";
 let nameUnavailable = false;
 let onWrite = null;
+let beforeWrite = null;
 globalThis.acTestNativeModules = {
   ArdiaSync: {
     newDeviceId: () => `dev${++ids}`,
@@ -33,6 +34,8 @@ globalThis.acTestNativeModules = {
     chainStatus: async () => chainStatus,
     write: async (_folder, scope, payload) => {
       folderCalls.push("write");
+      beforeWrite?.(JSON.parse(payload));
+      if (chainStatus === "missing") throw new Error("Sync data is missing from this folder.");
       const id = `f${folder.size + 1}`;
       folder.set(id, { scope, payload });
       onWrite?.(JSON.parse(payload));
@@ -76,6 +79,7 @@ const freshFolder = () => {
   chainStatus = "ok";
   nameUnavailable = false;
   onWrite = null;
+  beforeWrite = null;
 };
 const start = (engine) => {
   engine.startSync();
@@ -204,6 +208,7 @@ test("a missing chain preserves an unflushed outbox until automatic recovery", a
   const before = structuredClone(doc());
   assert.ok(before.scopes.app.outbox.length > 0, "an extraction failure leaves edits queued before flush");
   const disk = syncDisk();
+  assert.deepEqual(JSON.parse(disk.get("sync-state.nns").slice(7)).app.outbox, before.scopes.app.outbox, "unrelated failures still save the unflushed outbox durably");
   const calls = folderCalls.length;
 
   chainStatus = "missing";
@@ -222,4 +227,69 @@ test("a missing chain preserves an unflushed outbox until automatic recovery", a
   assert.equal(published.seq, before.scopes.app.seq + 1);
   for (const op of before.scopes.app.outbox) assert.ok(published.ops.some((sent) => JSON.stringify(sent) === JSON.stringify(op)));
   assert.deepEqual(doc().scopes.app.outbox, []);
+});
+
+test("a chain disappearing after preflight retains the write journal through restart and automatic recovery", async () => {
+  freshFolder();
+  const first = await import("./engine.ts?missing-during-write-before");
+  const doc = start(first);
+  assert.ok("ok" in (await first.turnOnSync("/sync")));
+  await first.syncNow();
+  await settle();
+  const before = structuredClone(doc());
+  const disk = syncDisk();
+  let original;
+  let journalAtWrite;
+  beforeWrite = (file) => {
+    if (!file.ops?.some((op) => op.v?.t === "Interrupted")) return;
+    original = structuredClone(file);
+    journalAtWrite = shell.docs.get("sync-journal.nns");
+    chainStatus = "missing";
+  };
+  S().addBookmark({ profileId: "default", url: "https://interrupted.example/", title: "Interrupted" });
+  await first.syncNow();
+  await settle();
+  beforeWrite = null;
+  assert.ok(original, "the preflight succeeds before the chain disappears at the write");
+  assert.ok(journalAtWrite, "the pending batch reaches disk before the transport fails");
+  assert.equal(first.useSync.getState().status, "stalled");
+  assert.match(first.useSync.getState().error, /missing/i);
+  assert.equal(shell.docs.get("sync-journal.nns"), journalAtWrite, "a missing transport cannot prune the durable journal");
+  assert.equal(shell.docs.get("sync-state.nns"), disk.get("sync-state.nns"), "a missing transport cannot replace the last saved state");
+  assert.equal(shell.docs.get("sync.json"), disk.get("sync.json"));
+  const scope = `p:${before.profiles.default.syncId}`;
+  assert.deepEqual(doc().scopes[scope].journal, [original]);
+  assert.ok(keys.has(before.deviceId));
+  assert.deepEqual(forgotten, []);
+  const calls = folderCalls.length;
+  await retry();
+  assert.equal(folderCalls.length, calls);
+  assert.equal(shell.docs.get("sync-journal.nns"), journalAtWrite);
+  S().addBookmark({ profileId: "default", url: "https://queued-after-interruption.example/", title: "Queued after interruption" });
+  await first.syncNow();
+  await settle();
+  assert.equal(folderCalls.length, calls);
+  assert.equal(shell.docs.get("sync-journal.nns"), journalAtWrite);
+
+  timers.clear();
+  const second = await import("./engine.ts?missing-during-write-after");
+  const restored = start(second);
+  await settle();
+  assert.deepEqual(restored().scopes[scope].journal, [original]);
+  await second.syncNow();
+  await settle();
+  assert.equal(folderCalls.length, calls);
+  assert.equal(shell.docs.get("sync-journal.nns"), journalAtWrite);
+
+  chainStatus = "ok";
+  await retry();
+  assert.equal(second.useSync.getState().status, "updated");
+  const replayed = logs().filter((file) => file.device === original.device && file.seq === original.seq && file.ops.some((op) => op.v?.t === "Interrupted"));
+  assert.deepEqual(replayed, [original], "the failed write is replayed with its original identity and payload");
+  const queued = logs().find((file) => file.ops.some((op) => op.v?.t === "Queued after interruption"));
+  assert.ok(queued);
+  assert.equal(queued.seq, original.seq + 1);
+  assert.equal(queued.device, original.device);
+  assert.equal(shell.docs.get("sync-journal.nns"), "");
+  assert.deepEqual(forgotten, []);
 });

@@ -387,6 +387,7 @@ async function runCycle({ retiring = false } = {}) {
     publishUi({ status: "updated", error: null, pending });
   } catch (error) {
     console.warn("[sync] cycle failed", error);
+    missingChain = (await native.chainStatus(doc.folder).catch(() => null)) === "missing";
     publishUi({ status: "stalled", error: errorText(error) });
   } finally {
     clearTimeout(slow);
