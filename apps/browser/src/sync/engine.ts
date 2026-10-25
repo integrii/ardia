@@ -328,13 +328,15 @@ async function runCycle({ retiring = false } = {}) {
     return;
   }
   running = true;
+  let missingChain = false;
   clearTimeout(timer);
   const slow = setTimeout(() => useSync.getState().status === "updated" && publishUi({ status: "updating" }), 1000);
   try {
     await watchExtensions();
     const status = await native.chainStatus(doc.folder);
     if (status === "unavailable") return publishUi({ status: "offline", error: null });
-    if (status === "missing") return await resetFromElsewhere();
+    missingChain = status === "missing";
+    if (missingChain) return publishUi({ status: "stalled", error: "Sync data is missing from this folder. Your local sync data is kept, and Ardia will retry automatically." });
     const transport = folderTransport(native, doc.folder);
     const clock = new Clock(doc.deviceId, doc.clock);
     const device = doc.deviceId;
@@ -389,7 +391,7 @@ async function runCycle({ retiring = false } = {}) {
   } finally {
     clearTimeout(slow);
     running = false;
-    save();
+    if (!missingChain) save();
     if (doc.enabled) {
       if (again) {
         again = false;
@@ -475,14 +477,6 @@ function linkProfiles(app: ScopeState) {
     }
   }
   for (const [id, link] of Object.entries(doc.profiles)) if (!s.profiles[id] && !link.retire) link.retire = true;
-}
-
-async function resetFromElsewhere() {
-  await SyncNative?.forget(doc.deviceId!);
-  doc = { ...emptyDoc(), folder: doc.folder, types: doc.types };
-  clearJournal();
-  save();
-  publishUi({ status: "reset", error: "This device is out of sync. Sync may have been reset from another device." });
 }
 
 function summarize(): Pick<SyncUi, "devices" | "remoteTabs" | "remoteProfiles"> {
