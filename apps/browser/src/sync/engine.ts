@@ -771,14 +771,31 @@ export async function enterRecoveryPhrase(folder: string, text: string): Promise
   const native = SyncNative;
   if (!native) return { error: "unavailable" };
   if (doc.enabled && doc.deviceId) {
+    const target = doc;
     const result = await native.enterPhrase(doc.deviceId, text, doc.folder ?? folder);
-    if ("ok" in result) {
+    if (doc !== target || stopping) return { error: "unavailable" };
+    if ("ok" in result && !stateReady) {
       try {
+        if (currentCycle) {
+          let deadline: ReturnType<typeof setTimeout> | undefined;
+          try {
+            await Promise.race([
+              currentCycle,
+              new Promise<never>((_, reject) => { deadline = setTimeout(() => reject(new Error("Sync is still busy. Try your recovery phrase again.")), 10_000); }),
+            ]);
+          } finally {
+            clearTimeout(deadline);
+          }
+        }
+        if (doc !== target || stopping) return { error: "unavailable" };
+        if (stateReady) return result;
         if (!await loadState()) return { error: "unavailable" };
+        if (doc !== target || stopping) return { error: "unavailable" };
         stateReady = true;
         publishUi({ status: "starting", error: null });
         scheduleSync(0);
       } catch (error) {
+        if (doc !== target || stopping) return { error: "unavailable" };
         stateReady = false;
         publishUi({ status: "stalled", error: errorText(error) });
         return { error: "unavailable" };

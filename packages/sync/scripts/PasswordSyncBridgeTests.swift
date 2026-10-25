@@ -1,8 +1,17 @@
 import Foundation
 
+private struct ExactLoginStore {
+  private var rows: [Data: PasswordSyncLogin] = [:]
+  var values: [PasswordSyncLogin] { Array(rows.values) }
+  subscript(key: String) -> PasswordSyncLogin? {
+    get { rows[Data(key.utf8)] }
+    set { rows[Data(key.utf8)] = newValue }
+  }
+}
+
 @MainActor
 private final class FixtureStore: PasswordSyncStore {
-  var values: [String: PasswordSyncLogin] = [:]
+  var values = ExactLoginStore()
   var reads = 0
   var writes = 0
   var unavailable = false
@@ -26,7 +35,12 @@ private final class FixtureStore: PasswordSyncStore {
       self.beforeWrite?()
       guard authorized(), !self.failWrite, self.values[key] == expected else { completion(false); return }
       self.writes += 1
-      if !self.failSettle { self.values[key] = desired }
+      if !self.failSettle {
+        self.values[key] = desired.map { login in
+          PasswordSyncLogin(origin: login.origin, username: login.username, password: login.password,
+                            created: expected == nil ? login.created : expected?.created)
+        }
+      }
       completion(true)
     }
     if delayWrite { delayedWrite = write }
@@ -86,7 +100,8 @@ private struct PasswordSyncBridgeTests {
     precondition(!unsettled && store.values[key] == old)
     store.failSettle = false
     let retried = await sync.apply(binding, changes: changes)
-    precondition(retried && store.values[key] == desired)
+    precondition(retried && store.values[key]?.password == desired.password)
+    precondition(store.values[key]?.created == old.created, "password update must preserve the native creation date")
     let writes = store.writes
     let idempotent = await sync.apply(binding, changes: changes)
     precondition(idempotent && store.writes == writes)
@@ -141,9 +156,14 @@ private struct PasswordSyncBridgeTests {
     let identityChanges = try store.extraRows.map { login in
       ["key": login.key!, "desired": try codec.seal(login, key: login.key!, binding: binding).json, "base": NSNull()] as [String: Any]
     }
-    let identitiesApplied = await sync.apply(binding, changes: identityChanges)
-    precondition(identitiesApplied)
     store.extraRows = []
+    let writesBeforeIdentities = store.writes
+    let identitiesApplied = await sync.apply(binding, changes: identityChanges)
+    precondition(identitiesApplied && store.writes == writesBeforeIdentities + 2, "both exact Unicode identities must be inserted")
+    precondition(store.values[composedUser.key!]?.password == composedUser.password, "NFC identity must retain its own password")
+    precondition(store.values[decomposedUser.key!]?.password == decomposedUser.password, "NFD identity must retain its own password")
+    store.values[composedUser.key!] = nil
+    store.values[decomposedUser.key!] = nil
 
     let epochLogin = PasswordSyncLogin(origin: old.origin, username: "epoch-user", password: "epoch-secret", created: 0)
     let undatedLogin = PasswordSyncLogin(origin: old.origin, username: "undated-user", password: "undated-secret", created: nil)
@@ -158,6 +178,6 @@ private struct PasswordSyncBridgeTests {
     precondition(deleted && store.values[key] == nil)
     let localDeletion = await sync.apply(binding, changes: changes)
     precondition(!localDeletion && store.values[key] == nil)
-    print("PasswordSync bridge: authorization, opaque output, conflicts, failure, settle/retry, revocation, unavailable stores, scope, tampering, timeout, and deletion checks passed")
+    print("PasswordSync bridge with hypothetical conditional-mutation store, not Chromium: authorization, opaque output, creation dates, distinct Unicode insertions, conflicts, failure, settle/retry, revocation, unavailable stores, scope, tampering, timeout, and deletion checks passed")
   }
 }

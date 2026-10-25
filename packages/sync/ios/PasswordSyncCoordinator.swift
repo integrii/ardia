@@ -129,7 +129,8 @@ final class PasswordSyncCoordinator {
   private func current(_ approval: Approval) -> Bool {
     guard let snapshot = snapshot(), snapshot.generation == approval.snapshot.generation,
           snapshot.keys.chainTag == approval.snapshot.keys.chainTag,
-          Self.canonicalFolder(approval.folder) == approval.folder else { return false }
+          Self.canonicalFolder(approval.folder) == approval.folder,
+          SyncVault(folder: URL(fileURLWithPath: approval.folder), keys: snapshot.keys).chainExists() else { return false }
     return true
   }
 

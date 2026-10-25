@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import path from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { runInNewContext } from "node:vm";
 
 const source = readFileSync(new URL("./e2e.mjs", import.meta.url), "utf8");
@@ -53,6 +56,10 @@ test("state uses the current bound native API and compares fingerprints, not cip
     ["readPasswordRecords", "/scratch/synthetic-chain", `p:${"a".repeat(26)}`, ""],
     ["readPasswordRecords", "/scratch/synthetic-chain", `p:${"a".repeat(26)}`, ""],
   ]);
+  assert.deepEqual(h.calls.filter(([method]) => method === "passwordSyncAuthorized"), [
+    ["passwordSyncAuthorized", "/scratch/synthetic-chain", `p:${"a".repeat(26)}`, ""],
+    ["passwordSyncAuthorized", "/scratch/synthetic-chain", `p:${"a".repeat(26)}`, ""],
+  ]);
   assert.match(native, /readPasswordRecords\(folder: string, scope: string, engineProfile: string\)/);
   assert.doesNotMatch(source, /\.readPasswords\s*\(/);
 });
@@ -94,5 +101,65 @@ test("non-password and stopped-sync state do not call protected record APIs", as
     assert.equal(state.passwords, null);
     assert.deepEqual(state.chromePasswords, ["https://fixture.example fixture"]);
     assert.deepEqual(h.calls, []);
+  }
+});
+
+test("enabled relaunch waits for initial sync startup before authorizing passwords", async () => {
+  const start = source.indexOf("async function start(name) {");
+  const end = source.indexOf("const short =", start);
+  const events = [];
+  let status = "starting";
+  const api = runInNewContext(`${source.slice(start, end)}\n({ start });`, {
+    DEV: { B: { dir: "/scratch/B" } }, apps: {}, APP: "/scratch/Ardia.app", FOLDER: "/scratch/chain", PASSWORDS: true,
+    launch: async () => ({ pid: 123, port: 456, log: "/scratch/log" }),
+    note: () => {},
+    ev: async (_name, body) => new AsyncFunction("acSync", body)({ useSync: { getState: () => ({ enabled: true, status }) } }),
+    until: async (_what, poll) => {
+      events.push("waiting");
+      assert.equal(await poll(), false);
+      status = "passwordsPaused";
+      assert.equal(await poll(), true);
+      events.push("ready");
+    },
+    authorizePasswords: async () => { assert.notEqual(status, "starting"); events.push("authorized"); },
+  });
+  await api.start("B");
+  assert.deepEqual(events, ["waiting", "ready", "authorized"]);
+});
+
+test("default hidden mode is explicitly non-password with visible coverage exclusions", () => {
+  assert.match(source, /const MODE = .*\?\? "--non-passwords";/);
+  assert.match(source, /non-password sync only; password propagation checks excluded/);
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  assert.match(pkg.scripts.test, /node --test scripts\/e2e-api\.test\.mjs/);
+});
+
+test("integration runner removes only auto-owned scratch on success and compiler failure", () => {
+  const directory = path.dirname(fileURLToPath(import.meta.url));
+  const work = mkdtempSync(path.join(directory, ".scratch-ownership-test-"));
+  try {
+    const bin = path.join(work, "bin");
+    const temporary = path.join(work, "temporary");
+    const caller = path.join(work, "caller-owned");
+    for (const folder of [bin, temporary, caller]) mkdirSync(folder);
+    writeFileSync(path.join(caller, "keep"), "caller-owned");
+    writeFileSync(path.join(bin, "swiftc"), `#!${process.execPath}
+import fs from "node:fs";
+if (process.env.FIXTURE_COMPILER_FAIL === "1") process.exit(17);
+const output = process.argv[process.argv.indexOf("-o") + 1];
+fs.writeFileSync(output, "#!/bin/sh\\nexit 0\\n", { mode: 0o700 });
+`, { mode: 0o700 });
+    for (const fail of ["0", "1"]) {
+      const env = { ...process.env, TMPDIR: temporary, PATH: `${bin}:${process.env.PATH}`, FIXTURE_COMPILER_FAIL: fail };
+      const automatic = spawnSync("/bin/bash", [path.join(directory, "password-integration.sh")], { env, encoding: "utf8", timeout: 10_000 });
+      assert.equal(automatic.status, fail === "1" ? 17 : 0, automatic.stderr);
+      assert.deepEqual(readdirSync(temporary), []);
+      const explicit = spawnSync("/bin/bash", [path.join(directory, "password-integration.sh"), caller], { env, encoding: "utf8", timeout: 10_000 });
+      assert.equal(explicit.status, fail === "1" ? 17 : 0, explicit.stderr);
+      assert.equal(readFileSync(path.join(caller, "keep"), "utf8"), "caller-owned");
+      assert.ok(readdirSync(caller).includes("password-check"));
+    }
+  } finally {
+    rmSync(work, { recursive: true, force: true });
   }
 });

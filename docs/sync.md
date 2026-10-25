@@ -309,9 +309,11 @@ What Chrome Sync does for extensions, through our folder (`packages/sync/src/ext
 
 Saved passwords are Chrome's (its password manager).
 
-The issue 241 changes in this checkout are **not ready to ship**: the current presenter-level
-expected-current check is not atomic with the database write. See
-[`sync-password-draft.md`](sync-password-draft.md) for the unresolved race and required engine tests.
+The issue 241 changes in this checkout are **not ready to ship**. Incoming password updates are
+paused: the native sync mutation endpoint always returns false/unavailable without accessing
+the store, including for equal-value/no-op requests. The unsafe presenter-level check followed
+by an unconditional write has been removed, not replaced with database CAS. See
+[`sync-password-draft.md`](sync-password-draft.md) for the blocked implementation and required engine tests.
 
 - **Consent.** New setups leave password sync off. Unlock Password Sync requests native device
   authentication for the exact approved folder, chain, profiles and scopes. Saved preferences
@@ -320,19 +322,26 @@ expected-current check is not atomic with the database write. See
 - **Reading.** Native code uses typed Chrome services instead of independently decrypting
   `Login Data`. The raw `readPasswords` bridge is removed. JavaScript receives native-sealed
   records and keyed fingerprints, not plaintext credentials. Generic remote and local-state
-  readers also convert legacy password values before crossing that boundary.
+  readers also convert legacy password values before crossing that boundary. Native reads
+  validate the entire password identity collection before sending rows: multiple affiliated
+  origins, unsupported origins or duplicate origin/username identities make the whole read
+  unavailable. No ambiguous row is omitted as though deleted. The bridge discards buffered
+  rows on failure or revocation. Full grouped-credential support remains unimplemented.
 - **Merge.** Existing TypeScript merge logic retains opaque password records and causal metadata.
   Native envelopes authenticate chain, scope and exact record identity. Randomized ciphertext
-  is not a change detector: stable authenticated fingerprints are. Creation dates survive the
-  typed bridge; an unknown initial date must not make an old joining credential win as new.
+  is not a change detector: stable authenticated fingerprints are. Read creation dates survive
+  the typed bridge; an unknown initial date must not make an old joining credential win as new.
+  Carrying the source date through future conditional insertion remains a blocked requirement.
 - **Apply recovery.** Candidate apply results and unapplied keys are persisted before native
   mutation. Earlier candidates survive changed retry targets and restarts. The checkpoint
   includes the observed clock; startup recovers its lower bound from persisted records and
   journals. Failed checkpoints prevent mutation and keep password status paused.
-- **Writing limitation.** Existing credentials are edited, not deleted and re-added. The current
-  presenter comparison can still miss a queued or not-yet-notified local change. A transactional
-  conditional mutation in Chromium's password backend is required before promising that local
-  edits cannot be overwritten. Settling the presenter is not proof of disk durability.
+- **Writing limitation.** All native sync insert, update and delete operations are disabled;
+  ordinary user password-manager actions are unchanged. A transactional conditional mutation
+  in Chromium's password backend, committed/conflict/error results and date-preserving new
+  insertion are required before incoming password updates can resume. No presenter comparison
+  or settling loop proves atomicity or disk durability. This is a safety mitigation, not
+  completed password synchronization.
 - **Cadence.** Authorized passwords are read at most every 30 seconds, or with Sync Now.
   Denied or unavailable reads are not empty stores. Disabling password sync does not delete
   local passwords. A framework without the new native endpoints fails closed.
@@ -426,6 +435,8 @@ bookmark, settings, profile or group edit, and on Sync Now. A cycle:
   instances (then a third) with their own data folders through a temporary sync folder, never
   iCloud Drive, over the dev harness. It checks 54 things, and all 54 passed on 2026-10-21 (Debug
   build), including pinned rows, tiles and a pinned group, an unpin, and B quit and relaunched.
+  These historical password propagation results predate the blocked native-password draft;
+  they are not evidence for its new authorization, typed bridge or disabled incoming writes.
   - Extensions, with real Chrome Web Store extensions over the network (Picture-in-Picture by Google, Google
     Translate): A installs one through Chrome's updater with no prompt; it comes in off for its permissions until
     A's user accepts Chrome's prompt; then it reaches B approved and on (same version, same permissions). A's

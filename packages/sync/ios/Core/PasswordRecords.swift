@@ -49,7 +49,7 @@ public struct PasswordRecords {
   }
 
   private enum Direction { case opaque, legacy }
-  private static let maximumPayloadBytes = 32 * 1024 * 1024
+  static let maximumPayloadBytes = 32 * 1024 * 1024
   private static let maximumCredentialBytes = 1024 * 1024
   private let encryptionKey: SymmetricKey
   private let fingerprintKey: SymmetricKey
@@ -124,6 +124,17 @@ public struct PasswordRecords {
     let object = try Self.object(json)
     if object["kind"] != nil { return try Self.encode(wire(object, scope: scope, direction: .opaque)) }
     return try Self.encode(state(object, scope: scope))
+  }
+
+  static func decodeLocalState(_ sealed: String, maximumPayloadBytes: Int = PasswordRecords.maximumPayloadBytes, decode: (String) -> Data? = { Data(base64Encoded: $0) }) -> Data? {
+    guard maximumPayloadBytes >= 0, maximumPayloadBytes <= Self.maximumPayloadBytes else { return nil }
+    let framedBytes = maximumPayloadBytes + MemoryLayout<UInt32>.size
+    let paddedBytes = ((framedBytes + SyncKeys.padding - 1) / SyncKeys.padding) * SyncKeys.padding
+    let maximumFileBytes = SyncKeys.magic.count + 12 + paddedBytes + 16
+    let maximumEncodedBytes = ((maximumFileBytes + 2) / 3) * 4
+    guard sealed.utf8.count <= maximumEncodedBytes,
+          let data = decode(sealed), data.count <= maximumFileBytes else { return nil }
+    return data
   }
 
   private func associatedData(scope: String, recordKey: String) throws -> Data {
@@ -235,8 +246,9 @@ public struct PasswordRecords {
     state["records"] = try records(state["records"], scope: scope, direction: .opaque)
     state["base"] = try Self.mapIndexed(state["base"]) { key, value in
       guard let encoded = value as? String else { throw Failure.format }
+      let decoded = try Self.decodeBase(encoded)
       if key.hasPrefix("pw:") {
-        return String(decoding: try Self.encode(transform(Self.decode(Data(encoded.utf8)), scope: scope, recordKey: key, direction: .opaque)), as: UTF8.self)
+        return String(decoding: try Self.encode(transform(decoded, scope: scope, recordKey: key, direction: .opaque)), as: UTF8.self)
       }
       return encoded
     }
@@ -343,6 +355,28 @@ public struct PasswordRecords {
     guard data.count <= maximumPayloadBytes else { throw Failure.format }
     do { return try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) }
     catch { throw Failure.format }
+  }
+
+  private static func decodeBase(_ text: String) throws -> Any {
+    let data = Data(text.utf8)
+    let decoded = try decode(data)
+    var quoted = false
+    var escaped = false
+    var previous: UInt8?
+    for byte in data {
+      if quoted {
+        if escaped { escaped = false }
+        else if byte == 92 { escaped = true }
+        else if byte == 34 { quoted = false }
+      } else if byte == 34 {
+        quoted = true
+        previous = byte
+      } else if byte != 9 && byte != 10 && byte != 13 && byte != 32 {
+        guard !((byte == 93 || byte == 125) && previous == 44) else { throw Failure.format }
+        previous = byte
+      }
+    }
+    return decoded
   }
 
   private static func encode(_ json: Any) throws -> Data {

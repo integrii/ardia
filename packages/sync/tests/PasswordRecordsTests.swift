@@ -43,7 +43,61 @@ final class PasswordRecordsTests: XCTestCase {
 
   private func assertSecretAbsent(_ payload: Data, file: StaticString = #filePath, line: UInt = #line) {
     XCTAssertNil(payload.range(of: Data(login.password.utf8)), file: file, line: line)
-    XCTAssertFalse(String(decoding: payload, as: UTF8.self).contains("\\\"p\\\""), file: file, line: line)
+    XCTAssertFalse(passwordFieldPresent(payload, escaped: false), file: file, line: line)
+    XCTAssertFalse(passwordFieldPresent(payload, escaped: true), file: file, line: line)
+  }
+
+  private func passwordFieldPresent(_ payload: Data, escaped: Bool) -> Bool {
+    String(decoding: payload, as: UTF8.self).contains(escaped ? "\\\"p\\\"" : "\"p\"")
+  }
+
+  func testSecrecyChecksDetectRawAndEscapedPlaintextWithoutMatchingTheSentinel() throws {
+    let plaintext = try encode(["p": "untracked-fixture"])
+    let escapedPlaintext = try encode(["base": [login.recordKey: String(decoding: plaintext, as: UTF8.self)]])
+    for payload in [plaintext, escapedPlaintext] {
+      XCTAssertNil(payload.range(of: Data(login.password.utf8)))
+    }
+    XCTAssertTrue(passwordFieldPresent(plaintext, escaped: false))
+    XCTAssertTrue(passwordFieldPresent(escapedPlaintext, escaped: true))
+    let sealed = try passwords.seal(login, scope: scope, recordKey: login.recordKey)
+    assertSecretAbsent(try encode(sealed.json))
+  }
+
+  func testLocalStateBase64IsBoundedBeforeDecodingAndAllowsPaddingAtTheLimit() throws {
+    XCTAssertEqual(PasswordRecords.maximumPayloadBytes, 32 * 1024 * 1024)
+    for limit in [0, 1, SyncKeys.padding - 4, SyncKeys.padding - 3, SyncKeys.padding] {
+      let payload = Data(repeating: 65, count: limit)
+      let file = try keys.seal(payload, scopeTag: "local", fileId: "state")
+      let encoded = file.base64EncodedString()
+      XCTAssertEqual(PasswordRecords.decodeLocalState(encoded, maximumPayloadBytes: limit), file)
+      var decodedOversized = false
+      XCTAssertNil(PasswordRecords.decodeLocalState(String(repeating: "A", count: encoded.utf8.count + 4), maximumPayloadBytes: limit, decode: { _ in
+        decodedOversized = true
+        return Data()
+      }))
+      XCTAssertFalse(decodedOversized)
+      XCTAssertNil(PasswordRecords.decodeLocalState((file + Data([0])).base64EncodedString(), maximumPayloadBytes: limit))
+    }
+  }
+
+  func testNonPasswordBaseJSONIsValidatedOnSealingAndOpeningWithoutRewritingValidStrings() throws {
+    let bridge = PasswordBridgePayloads(keys: keys)
+    for encoded in ["{broken", "", "undefined", "[1,]", "{\"text\":1,}"] {
+      let local: [String: Any] = [scope: ["records": [:], "base": ["tab:unrelated": encoded], "outbox": []]]
+      let payload = try encode(local)
+      XCTAssertThrowsError(try bridge.sealLocal(String(decoding: payload, as: UTF8.self)))
+      let sealed = try keys.seal(payload, scopeTag: "local", fileId: "state").base64EncodedString()
+      XCTAssertThrowsError(try bridge.openLocal(sealed))
+    }
+    for encoded in ["null", " true ", "17", "\"quoted \\\"p\\\" ,] \\\\ text\"", "{ \"é\": 1, \"e\\u0301\": 2 }"] {
+      let local: [String: Any] = [scope: ["records": [:], "base": ["tab:unrelated": encoded], "outbox": []]]
+      let sealed = try bridge.sealLocal(String(decoding: encode(local), as: UTF8.self))
+      let opened = try decode(Data(bridge.openLocal(sealed).utf8))
+      let state = try XCTUnwrap(opened[scope] as? [String: Any])
+      let base = try XCTUnwrap(state["base"] as? NSDictionary)
+      let preserved = try XCTUnwrap(base.object(forKey: "tab:unrelated") as? String)
+      XCTAssertEqual(Array(preserved.utf8), Array(encoded.utf8))
+    }
   }
 
   private func assertEnvelope(_ json: Any, scope: String? = nil, key: String? = nil, file: StaticString = #filePath, line: UInt = #line) throws {

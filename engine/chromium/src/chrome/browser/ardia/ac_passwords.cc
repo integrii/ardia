@@ -22,6 +22,7 @@
 #include "base/timer/timer.h"
 #include "chrome/browser/extensions/api/passwords_private/passwords_private_delegate.h"
 #include "chrome/browser/extensions/api/passwords_private/passwords_private_delegate_factory.h"
+#include "chrome/browser/ardia/ac_passwords_sync_policy.h"
 #include "chrome/browser/ardia/ac_reauth.h"
 #include "chrome/browser/ardia/ac_sensitive_args.h"
 #include "chrome/common/extensions/api/passwords_private.h"
@@ -337,18 +338,10 @@ class SyncRequest {
     authorized_ = nullptr;
     login_ = nullptr;
     session.reset();
-    expected.reset();
-    desired.reset();
-    origin.clear();
-    username.clear();
     done(context, success ? 1 : 0);
   }
 
   std::optional<Session> session;
-  std::optional<Secret> expected;
-  std::optional<Secret> desired;
-  std::string origin;
-  std::string username;
 
  private:
   ac_passwords_sync_authorized_t authorized_;
@@ -743,6 +736,10 @@ extern "C" AC_ENGINE_EXPORT void ac_passwords_sync_read(
   ardia::WithSyncList(std::move(request), base::BindOnce(
       [](std::shared_ptr<ardia::SyncRequest> request, const Entries&) {
         ardia::SyncCredentials credentials(request->session->delegate.get());
+        if (!ardia::SyncSnapshotSupported(credentials.entries, ardia::Syncable,
+                                          ardia::SyncOrigins)) {
+          return request->Finish(false);
+        }
         for (const auto& credential : credentials.entries) {
           if (!ardia::Syncable(credential)) {
             continue;
@@ -772,88 +769,12 @@ extern "C" AC_ENGINE_EXPORT void ac_passwords_sync_read(
 }
 
 extern "C" AC_ENGINE_EXPORT void ac_passwords_sync_compare_and_set(
-    const char* profile_dir,
-    const char* args_json,
-    ac_passwords_sync_authorized_t authorized,
+    const char*,
+    const char*,
+    ac_passwords_sync_authorized_t,
     ac_passwords_sync_done_t done,
     void* context) {
-  auto request = ardia::BeginSync(profile_dir, authorized, nullptr, done, context);
-  if (!request) {
-    return;
+  if (done) {
+    done(context, 0);
   }
-  ardia::SensitiveArgs args(args_json, ardia::kMaxSecretArgsBytes);
-  if (!args.dict() || args.dict()->FindBool("offTheRecord").value_or(false)) {
-    return request->Finish(false);
-  }
-  const std::string* origin = args.dict()->FindString("origin");
-  const std::string* username = args.dict()->FindString("username");
-  const auto expected_present = args.dict()->FindBool("expectedPresent");
-  const auto desired_present = args.dict()->FindBool("desiredPresent");
-  auto expected = args.SecretAt("expectedPassword");
-  auto desired = args.SecretAt("desiredPassword");
-  if (!origin || origin->empty() || !username || !expected_present || !desired_present ||
-      !expected || !desired || expected->present() != *expected_present ||
-      desired->present() != *desired_present) {
-    return request->Finish(false);
-  }
-  request->origin = *origin;
-  request->username = *username;
-  request->expected = std::move(*expected);
-  request->desired = std::move(*desired);
-  ardia::WithSyncList(std::move(request), base::BindOnce(
-      [](std::shared_ptr<ardia::SyncRequest> request, const Entries&) {
-        const auto& origin = request->origin;
-        const auto& username = request->username;
-        const auto& expected = *request->expected;
-        const auto& desired = *request->desired;
-        if (!request->Allowed()) {
-          return request->Finish(false);
-        }
-        auto delegate = request->session->delegate;
-        auto* presenter = delegate->GetSavedPasswordsPresenter();
-        ardia::SyncCredentials credentials(delegate.get());
-        const password_manager::CredentialUIEntry* found = nullptr;
-        for (const auto& credential : credentials.entries) {
-          if (!ardia::Syncable(credential) || base::UTF16ToUTF8(credential.username) != username) {
-            continue;
-          }
-          const auto origins = ardia::SyncOrigins(credential);
-          if (!origins.contains(origin)) {
-            continue;
-          }
-          if (found || origins.size() != 1) {
-            return request->Finish(false);
-          }
-          found = &credential;
-        }
-        if (static_cast<bool>(found) != expected.present()) {
-          return request->Finish(false);
-        }
-        if (found) {
-          ardia::Secret current(base::UTF16ToUTF8(found->password));
-          if (current.value() != expected.value()) {
-            return request->Finish(false);
-          }
-        }
-        if (!request->Allowed()) {
-          return request->Finish(false);
-        }
-        bool changed = true;
-        if (found && desired.present()) {
-          password_manager::CredentialUIEntry change = *found;
-          ardia::Cleanse(change.password);
-          change.password = ardia::UTF16Of(desired);
-          const auto result = presenter->EditSavedCredentials(*found, change);
-          using EditResult = password_manager::SavedPasswordsPresenter::EditResult;
-          changed = result == EditResult::kSuccess || result == EditResult::kNothingChanged;
-          ardia::Cleanse(change.password);
-        } else if (found) {
-          changed = presenter->RemoveCredential(*found);
-        } else if (desired.present()) {
-          std::u16string password = ardia::UTF16Of(desired);
-          changed = delegate->AddPassword(origin, base::UTF8ToUTF16(username), password, u"", false);
-          ardia::Cleanse(password);
-        }
-        request->Finish(changed);
-      }));
 }

@@ -63,43 +63,52 @@ export const passwordSyncControls = new Map();
 const passwordEnvelopes = new Map();
 const passwordFingerprints = new Map();
 let passwordNonce = 0;
-const passwordEnvelope = (scope, key, login) => {
-  const identity = JSON.stringify([scope, key, login.password]);
+const passwordEnvelope = (chain, scope, key, login) => {
+  const identity = JSON.stringify([chain, scope, key, login.password]);
   if (!passwordFingerprints.has(identity)) passwordFingerprints.set(identity, `fingerprint-${passwordFingerprints.size}`);
   const value = { version: 2, sealed: `sealed-${++passwordNonce}`, fingerprint: passwordFingerprints.get(identity) };
-  passwordEnvelopes.set(value.sealed, { scope, key, login: { ...login }, fingerprint: value.fingerprint });
+  passwordEnvelopes.set(value.sealed, { chain, scope, key, login: { ...login }, fingerprint: value.fingerprint });
   return value;
 };
-const openPasswordEnvelope = (scope, key, value) => {
+const openPasswordEnvelope = (chain, scope, key, value) => {
   if (value === null) return null;
   const entry = passwordEnvelopes.get(value.sealed);
-  if (!entry || entry.scope !== scope || entry.key !== key || entry.fingerprint !== value.fingerprint) throw new Error("Invalid password envelope");
+  if (!entry || entry.chain !== chain || entry.scope !== scope || entry.key !== key || entry.fingerprint !== value.fingerprint) throw new Error("Invalid password envelope");
   return entry.login;
 };
 export const passwordSyncBridge = {
   readPasswordRecords: async (folder, scope, profile) => {
-    const control = passwordSyncControls.get(current.device);
+    const device = current.device;
+    const control = passwordSyncControls.get(device);
+    const chain = control?.chain ?? "fixture-chain";
+    const authorized = () => passwordSyncControls.get(device) === control && control?.authorized !== false && (control?.chain ?? "fixture-chain") === chain;
     control?.calls?.push({ op: "read", folder, scope, profile });
-    if (control?.authorized === false || control?.unavailable) return null;
-    const rows = [...logins()].map(([key, login]) => ({ key: `pw:${key}`, value: passwordEnvelope(scope, `pw:${key}`, login), created: login.created }));
+    if (!authorized() || control?.unavailable) return null;
+    const rows = [...passwordStores.get(device)].map(([key, login]) => ({ key: `pw:${key}`, value: passwordEnvelope(chain, scope, `pw:${key}`, login), created: login.created }));
     await control?.afterRead?.();
-    return rows;
+    return authorized() ? rows : null;
   },
   applyPasswordRecords: async (folder, scope, profile, changes) => {
-    const control = passwordSyncControls.get(current.device);
+    const device = current.device;
+    const control = passwordSyncControls.get(device);
+    const chain = control?.chain ?? "fixture-chain";
+    const authorized = () => passwordSyncControls.get(device) === control && control?.authorized !== false && (control?.chain ?? "fixture-chain") === chain;
     control?.calls?.push({ op: "apply", folder, scope, profile, changes });
-    if (control?.authorized === false || control?.failApply || control?.unavailable) return false;
-    const store = logins();
+    if (!authorized() || control?.failApply || control?.unavailable) return false;
+    const store = passwordStores.get(device);
     await control?.beforeApply?.();
-    for (const { key, desired, base } of changes) {
-      const want = openPasswordEnvelope(scope, key, desired);
-      const known = openPasswordEnvelope(scope, key, base);
-      const have = store.get(key.slice(3));
-      if (have?.password === want?.password) continue;
-      if (have?.password !== known?.password) return false;
-      if (want) store.set(key.slice(3), { ...want });
-      else store.delete(key.slice(3));
-    }
+    if (!authorized()) return false;
+    try {
+      for (const { key, desired, base } of changes) {
+        const want = openPasswordEnvelope(chain, scope, key, desired);
+        const known = openPasswordEnvelope(chain, scope, key, base);
+        const have = store.get(key.slice(3));
+        if (have?.password === want?.password) continue;
+        if (have?.password !== known?.password) return false;
+        if (want) store.set(key.slice(3), { ...want });
+        else store.delete(key.slice(3));
+      }
+    } catch { return false; }
     return !control?.unsettled;
   },
 };

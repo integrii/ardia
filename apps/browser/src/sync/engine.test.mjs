@@ -15,6 +15,8 @@ const folder = new Map();
 let onWrite = null;
 let ids = 0;
 let chainStatus = "ok";
+let chainWait = null;
+let stateOpens = 0;
 const keys = new Set();
 const forgotten = [];
 const folderCalls = [];
@@ -37,8 +39,9 @@ globalThis.acTestNativeModules = {
     createPhrase: async (id) => (keys.add(id), true),
     createChain: async () => {},
     unlock: async (id) => keys.has(id),
+    enterPhrase: async (id) => (keys.add(id), { ok: true }),
     forget: async (id) => { forgotten.push(id); keys.delete(id); },
-    chainStatus: async () => chainStatus,
+    chainStatus: async () => { if (chainWait) await chainWait; return chainStatus; },
     write: async (_folder, scope, payload) => {
       folderCalls.push("write");
       const id = `f${folder.size + 1}`;
@@ -58,6 +61,7 @@ globalThis.acTestNativeModules = {
       return `sealed:${text}`;
     },
     openLocal: async (sealed) => {
+      stateOpens++;
       if (!sealed.startsWith("sealed:")) throw new Error("Invalid encrypted sync state");
       return sealed.slice(7);
     },
@@ -186,6 +190,8 @@ const freshFolder = () => {
   forgotten.length = 0;
   folderCalls.length = 0;
   chainStatus = "ok";
+  chainWait = null;
+  stateOpens = 0;
   onWrite = null;
   passwordGrants.clear();
   passwordCalls.length = 0;
@@ -480,6 +486,86 @@ const landSave = async () => {
   shell.heldSaves.queue.shift()();
   await settle();
 };
+
+test("entering a phrase with ready state preserves unsaved scopes without reopening disk", async () => {
+  const { engine, doc } = await persistenceFixture("phrase-ready");
+  const scopes = doc().scopes;
+  scopes.app.pending = 17;
+  const opens = stateOpens;
+  assert.ok("ok" in await engine.enterRecoveryPhrase("/sync", "fixture phrase"));
+  assert.equal(doc().scopes, scopes);
+  assert.equal(doc().scopes.app.pending, 17);
+  assert.equal(stateOpens, opens);
+  await engine.persistScopes();
+  assert.equal(savedScopes().app.pending, 17);
+});
+
+test("entering a phrase during a cycle preserves its unsaved batch and exact scope objects", async () => {
+  const { engine, doc } = await persistenceFixture("phrase-midcycle");
+  const scopes = doc().scopes;
+  const opens = stateOpens;
+  shell.heldSaves.on = true;
+  S().addBookmark({ profileId: "default", url: "https://phrase.example/", title: "Phrase midcycle" });
+  const syncing = engine.syncNow();
+  try {
+    await settle();
+    assert.ok(shell.heldSaves.queue.length > 0, "the real cycle is suspended before publishing its batch");
+    assert.ok("ok" in await engine.enterRecoveryPhrase("/sync", "fixture phrase"));
+    assert.equal(doc().scopes, scopes, "a live cycle must never lose its scope references");
+    assert.equal(stateOpens, opens, "ready scopes are not reloaded from an older disk checkpoint");
+  } finally {
+    shell.heldSaves.on = false;
+    for (const land of shell.heldSaves.queue.splice(0)) land();
+    await syncing;
+    await settle();
+  }
+  const batches = logs().filter((file) => file.ops.some((op) => op.v?.t === "Phrase midcycle"));
+  assert.equal(batches.length, 1);
+  assert.ok(Object.values(savedScopes()).some((state) => Object.values(state.records).some((record) => record.v?.t === "Phrase midcycle")));
+});
+
+for (const timeout of [false, true]) {
+  test(`phrase recovery ${timeout ? "times out instead of reloading over" : "waits before reloading after"} an active cycle when state is not ready`, async () => {
+    const { engine } = await persistenceFixture(`phrase-not-ready-${timeout}`);
+    let finish;
+    chainWait = new Promise((resolve) => { finish = resolve; });
+    const syncing = engine.syncNow();
+    await settle();
+    keys.clear();
+    start(engine);
+    await settle();
+    assert.equal(engine.useSync.getState().status, "locked");
+    const opens = stateOpens;
+    let result;
+    const recovering = engine.enterRecoveryPhrase("/sync", "fixture phrase").then((value) => { result = value; });
+    try {
+      await settle();
+      assert.equal(result, undefined, "the old cycle still owns the state");
+      assert.equal(stateOpens, opens);
+      if (timeout) {
+        const waiting = [...timers.values()].filter(({ delay }) => delay === 10_000);
+        assert.equal(waiting.length, 1, "cycle recovery has a bounded deadline");
+        waiting[0].run();
+        await recovering;
+        assert.deepEqual(result, { error: "unavailable" });
+        assert.equal(engine.useSync.getState().status, "stalled");
+        assert.equal(stateOpens, opens);
+      }
+    } finally {
+      chainStatus = "unavailable";
+      finish();
+      await syncing;
+      chainWait = null;
+      await recovering;
+    }
+    if (!timeout) {
+      assert.ok("ok" in result);
+      assert.ok(stateOpens > opens);
+      assert.equal(engine.useSync.getState().status, "starting");
+    }
+    assert.equal([...timers.values()].filter(({ delay }) => delay === 10_000).length, 0);
+  });
+}
 
 test("persistScopes holds an effect and sequence metadata until its exact snapshot lands", async () => {
   const { engine, doc } = await persistenceFixture("held");

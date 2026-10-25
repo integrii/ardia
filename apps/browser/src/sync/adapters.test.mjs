@@ -1070,7 +1070,7 @@ test("passwords: failed apply and unsettled changes remain pending and retry wit
   assert.equal((await b.sync()).published, 0);
 });
 
-test("passwords: a local edit during native apply stays local and is published on retry", async () => {
+test("passwords: adapter conditional-apply contract keeps a mock local edit pending, not a queued Chromium backend race test", async () => {
   const folder = new Folder();
   const a = new Device("devA", folder);
   const b = new Device("devB", folder);
@@ -1087,6 +1087,46 @@ test("passwords: a local edit during native apply stays local and is published o
   await syncAll([b, a]);
   assert.equal(stub.passwordStores.get(a.id).get(key.slice(3)).password, "local-secret");
   assert.equal(b.scopes.p.unapplied.includes(key), false);
+});
+
+test("passwords: mock bridge revocation during async hooks returns no records and performs no mutation", async () => {
+  const a = new Device("revocation-fixture", new Folder());
+  await a.with(() => stub.savePassword("", "https://bank.example", "alice", "revoked-secret"));
+  const [row] = await stub.passwordSyncBridge.readPasswordRecords("fixture", "p", "");
+  for (const replaceControl of [false, true]) {
+    const control = {};
+    const revoke = async () => {
+      await Promise.resolve();
+      if (replaceControl) stub.passwordSyncControls.set(a.id, { authorized: false });
+      else control.authorized = false;
+    };
+    control.afterRead = revoke;
+    stub.passwordSyncControls.set(a.id, control);
+    assert.equal(await stub.passwordSyncBridge.readPasswordRecords("fixture", "p", ""), null);
+    control.authorized = true;
+    control.beforeApply = revoke;
+    stub.passwordSyncControls.set(a.id, control);
+    assert.equal(await stub.passwordSyncBridge.applyPasswordRecords("fixture", "p", "", [{ key: row.key, desired: null, base: row.value }]), false);
+    assert.equal(stub.passwordStores.get(a.id).get(row.key.slice(3)).password, "revoked-secret");
+  }
+});
+
+test("passwords: mock envelopes bind chain and scope but remain portable across same-chain folders", async () => {
+  const a = new Device("chain-fixture", new Folder());
+  const control = { chain: "chain-a" };
+  stub.passwordSyncControls.set(a.id, control);
+  await a.with(() => stub.savePassword("", "https://bank.example", "alice", "chain-secret"));
+  const [row] = await stub.passwordSyncBridge.readPasswordRecords("/computer-a/sync", "p", "");
+  const changes = [{ key: row.key, desired: row.value, base: null }];
+  stub.passwordStores.get(a.id).clear();
+  control.chain = "chain-b";
+  assert.equal(await stub.passwordSyncBridge.applyPasswordRecords("/computer-b/sync", "p", "", changes), false);
+  assert.equal(stub.passwordStores.get(a.id).size, 0);
+  control.chain = "chain-a";
+  assert.equal(await stub.passwordSyncBridge.applyPasswordRecords("/computer-b/sync", "other-scope", "", changes), false);
+  assert.equal(stub.passwordStores.get(a.id).size, 0);
+  assert.equal(await stub.passwordSyncBridge.applyPasswordRecords("/computer-b/sync", "p", "", changes), true);
+  assert.equal(stub.passwordStores.get(a.id).get(row.key.slice(3)).password, "chain-secret");
 });
 
 test("passwords: legacy plaintext or malformed native records cannot be sent through the adapter", async () => {

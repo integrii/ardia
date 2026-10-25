@@ -28,10 +28,13 @@ final class FixturePasswordStore: PasswordSyncStore {
   }
   func compareAndSet(profile: String, key: String, expected: PasswordSyncLogin?, desired: PasswordSyncLogin?,
                      authorized: @escaping () -> Bool, completion: @escaping (Bool?) -> Void) {
-    guard authorized(), logins.first(where: { $0.key == key }) == expected else { return completion(false) }
+    guard authorized(), logins.first(where: { $0.key?.utf8.elementsEqual(key.utf8) == true }) == expected else { return completion(false) }
     writes += 1
-    logins.removeAll { $0.key == key }
-    if let desired { logins.append(desired) }
+    logins.removeAll { $0.key?.utf8.elementsEqual(key.utf8) == true }
+    if let desired {
+      logins.append(PasswordSyncLogin(origin: desired.origin, username: desired.username, password: desired.password,
+                                     created: expected == nil ? desired.created : expected?.created))
+    }
     completion(true)
   }
 }
@@ -268,6 +271,15 @@ struct PasswordIntegrationChecks {
     let value = records![0]["value"]!
     let applied = await coordinator.apply(folder: folder.path, scope: scope, profile: "", changes: [["key": key, "desired": value, "base": value]])
     check(applied, "authorized opaque apply verifies settled state")
+    let updatedPassword = "updated-fixture-password"
+    let updatedLogin = PasswordSyncLogin(origin: "https://example.test", username: "fixture", password: updatedPassword, created: nil)
+    let updateBinding = PasswordSyncBinding(chain: keys.chainTag, folder: folder.path, scope: scope, profile: "")
+    let updatedValue = try PasswordSyncRecords(keys: keys).seal(updatedLogin, key: key, binding: updateBinding).json
+    let writesBeforeUpdate = store.writes
+    let updated = await coordinator.apply(folder: folder.path, scope: scope, profile: "", changes: [["key": key, "desired": updatedValue, "base": value]])
+    check(updated && store.writes == writesBeforeUpdate + 1, "opaque password update reaches fixture store")
+    check(store.logins.first?.password == updatedPassword, "opaque password update changes the stored secret")
+    check(store.logins.first?.created == 0, "opaque password update preserves native epoch creation date")
     for profile in ["incognito:window@profile", "../profile", "a/b", "a\\b", ".", ".."] {
       check(!PasswordSyncCoordinator.valid(scope: scope, profile: profile), "invalid engine profile rejected")
     }
@@ -275,9 +287,10 @@ struct PasswordIntegrationChecks {
     check(!PasswordSyncCoordinator.valid(scope: "p:short", profile: ""), "invalid profile scope rejected")
     check(PasswordSyncCoordinator.canonicalFolder("relative/path") == nil, "relative folder rejected")
     check(PasswordSyncCoordinator.canonicalFolder(folder.path + "/../other") == nil, "folder traversal rejected")
+    let invalidationsBeforeGenerationChange = invalidations
     generation += 1
     check(!coordinator.status(folder: folder.path, scope: scope, profile: ""), "key generation changes invalidate approval synchronously")
-    check(auth.calls == 1 && invalidations >= 2, "invalidations never silently reauthorize")
+    check(auth.calls == 1 && invalidations == invalidationsBeforeGenerationChange + 1, "generation revokes once without silently reauthorizing")
     let reauthorized = await coordinator.authorize(folder: folder.path, profiles: profiles)
     check(reauthorized && auth.calls == 2, "explicit reauthorization succeeds")
     store.deferRead = true
@@ -309,6 +322,6 @@ struct PasswordIntegrationChecks {
     check(finalAuthorization, "final fixture consent succeeds")
     now += 24 * 60 * 60
     check(!coordinator.status(folder: folder.path, scope: scope, profile: ""), "password session has a twenty-four-hour upper bound")
-    print("PASS: \(checks) production password bridge/coordinator assertions; mock store and isolated sync folder only")
+    print("PASS: \(checks) production password bridge/coordinator assertions; hypothetical conditional-mutation store, not Chromium; isolated sync folder only")
   }
 }

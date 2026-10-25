@@ -36,6 +36,15 @@ struct PasswordRecordsBoundaryTests {
     try check(data.range(of: Data(sentinel.utf8)) == nil, "no plaintext password in boundary JSON")
   }
 
+  private static func passwordFieldPresent(_ data: Data, escaped: Bool) -> Bool {
+    String(decoding: data, as: UTF8.self).contains(escaped ? "\\\"p\\\"" : "\"p\"")
+  }
+
+  private static func noPasswordFields(_ data: Data) throws {
+    try check(!passwordFieldPresent(data, escaped: false), "no raw plaintext password field")
+    try check(!passwordFieldPresent(data, escaped: true), "no escaped plaintext password field")
+  }
+
   static func main() {
     do {
       try run()
@@ -60,6 +69,19 @@ struct PasswordRecordsBoundaryTests {
     try check(first.sealed != second.sealed, "random nonces")
     try check(first.fingerprint == second.fingerprint, "stable fingerprints")
     try check(core.open(first, scope: scope, recordKey: key) == login, "authenticated roundtrip")
+    try localStateDecodeBounds(keys: keys)
+    let plaintext = try encode(["p": "untracked-fixture"])
+    let escapedPlaintext = try encode(["base": [key: String(decoding: plaintext, as: UTF8.self)]])
+    for (payload, label) in [(plaintext, "no raw plaintext password field"), (escapedPlaintext, "no escaped plaintext password field")] {
+      try check(payload.range(of: Data(sentinel.utf8)) == nil, "plaintext regression does not depend on sentinel matching")
+      do {
+        try noPasswordFields(payload)
+        throw Failure.assertion("plaintext field detection accepted a leak")
+      } catch Failure.assertion(let actual) {
+        try check(actual == label, "secrecy assertion detects intentionally leaked plaintext")
+      }
+    }
+    try noPasswordFields(encode(first.json))
     let other = PasswordRecords(keys: SyncKeys(entropy: Data(repeating: 42, count: 32)))
     try rejects("chain binding") { _ = try other.open(first, scope: scope, recordKey: key) }
     try rejects("scope binding") { _ = try core.open(first, scope: "p:other", recordKey: key) }
@@ -114,6 +136,7 @@ struct PasswordRecordsBoundaryTests {
     for file in [log(login.legacyValue), snapshot(login.legacyValue)] {
       let opaque = try core.transformWire(scope: scope, payload: encode(file))
       try noSecret(opaque)
+      try noPasswordFields(opaque)
       try check(object(core.outboundLegacyWire(scope: scope, payload: opaque)) as NSDictionary == file as NSDictionary, "wire roundtrip preserves causality")
       try check(core.transformWire(scope: scope, payload: opaque) == opaque, "opaque transformation idempotent")
       let another = try core.transformWire(scope: scope, payload: encode(file))
@@ -168,6 +191,19 @@ struct PasswordRecordsBoundaryTests {
     }
     try check(records["tab:other"]! as NSDictionary == record(unknownValue) as NSDictionary, "unknown non-password record values preserved")
     try check(convertedBase["tab:other"] == (state["base"] as! [String: String])["tab:other"], "unrelated base string preserved byte for byte")
+    for (index, encoded) in ["{broken", "", "undefined", "{\"text\":1} trailing", "[1,]", "{\"text\":1,}", "[1, \n ]"].enumerated() {
+      var invalid = state
+      invalid["base"] = ["tab:other": encoded]
+      try rejects("malformed unrelated base JSON \(index)") { _ = try core.transformLocal(scope: scope, payload: encode(invalid)) }
+      try rejects("malformed unrelated base JSON in root \(index)") { _ = try core.transformLocal(payload: encode([scope: invalid])) }
+    }
+    for encoded in ["null", " true ", "17", "\"quoted \\\"p\\\" ,] \\\\ text\"", "[1, false, { \"text\": \",}\" }]", "{ \"é\": 1, \"e\\u0301\": 2 }"] {
+      var valid = state
+      valid["base"] = ["tab:other": encoded]
+      let result = try object(core.transformLocal(scope: scope, payload: encode(valid)))
+      let preserved = (result["base"] as! NSDictionary).object(forKey: "tab:other") as? String
+      try check(preserved?.utf8.elementsEqual(encoded.utf8) == true, "valid unrelated JSON fragments and exact bytes preserved")
+    }
     try check(core.transformLocal(scope: scope, payload: transformed) == transformed, "state idempotency")
     for root: [String: Any] in [[scope: state], [scope: state, "p:second": state], ["scopes": [scope: state]], ["journal": [scope: [log(login.legacyValue)]]], ["scopes": [scope: state], "journal": [scope: [log(login.legacyValue)]]]] {
       let result = try core.transformLocal(payload: encode(root))
@@ -250,6 +286,37 @@ struct PasswordRecordsBoundaryTests {
     try check(preservedValue.object(forKey: "e\u{0301}" as NSString) as? Int == 2, "second unrelated Unicode property preserved")
     try unicodeAccounts(core: core, scope: scope)
     try applyProvenance(core: core, scope: scope)
+  }
+
+  private static func localStateDecodeBounds(keys: SyncKeys) throws {
+    try check(PasswordRecords.maximumPayloadBytes == 32 * 1024 * 1024, "shared production plaintext cap is 32 MiB")
+    for limit in [0, 1, 2, SyncKeys.padding - 5, SyncKeys.padding - 4, SyncKeys.padding - 3, SyncKeys.padding, SyncKeys.padding * 2 - 4, SyncKeys.padding * 2 - 3] {
+      let payload = Data(repeating: 65, count: limit)
+      let file = try keys.seal(payload, scopeTag: "local", fileId: "state")
+      let encoded = file.base64EncodedString()
+      let decoded = PasswordRecords.decodeLocalState(encoded, maximumPayloadBytes: limit)
+      try check(decoded == file, "maximum local payload includes length header, padding, magic, nonce, tag and base64 rounding")
+      try check(keys.open(decoded!, scopeTag: "local", fileId: "state") == payload, "maximum local payload decrypts without truncation")
+      for oversized in [String(repeating: "A", count: encoded.utf8.count + 4), String(repeating: "é", count: encoded.utf8.count / 2 + 1)] {
+        var decodedOversized = false
+        let result = PasswordRecords.decodeLocalState(oversized, maximumPayloadBytes: limit, decode: { _ in
+          decodedOversized = true
+          return Data()
+        })
+        try check(result == nil, "oversized encoded local state rejected")
+        try check(!decodedOversized, "oversized encoded local state rejected before decoder allocation")
+      }
+      try check(PasswordRecords.decodeLocalState((file + Data([0])).base64EncodedString(), maximumPayloadBytes: limit) == nil, "decoded local state cannot exceed its exact encrypted byte cap")
+    }
+    for limit in [-1, Int.max] {
+      var decodedInvalidLimit = false
+      try check(PasswordRecords.decodeLocalState("", maximumPayloadBytes: limit, decode: { _ in
+        decodedInvalidLimit = true
+        return Data()
+      }) == nil, "invalid helper limits fail closed without integer overflow")
+      try check(!decodedInvalidLimit, "invalid helper limits rejected before decoding")
+    }
+    try check(PasswordRecords.decodeLocalState("%%") == nil, "malformed local base64 rejected")
   }
 
   private static func unicodeAccounts(core: PasswordRecords, scope: String) throws {

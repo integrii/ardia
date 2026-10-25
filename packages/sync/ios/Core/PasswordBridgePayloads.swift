@@ -27,7 +27,7 @@ struct PasswordBridgePayloads {
   }
 
   func openLocal(_ sealed: String) throws -> String {
-    guard let data = Data(base64Encoded: sealed) else { throw Failure.invalidLocalState }
+    guard let data = PasswordRecords.decodeLocalState(sealed) else { throw Failure.invalidLocalState }
     let plain = try keys.open(data, scopeTag: "local", fileId: "state")
     return String(decoding: try records.transformLocal(payload: plain), as: UTF8.self)
   }

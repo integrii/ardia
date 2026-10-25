@@ -35,6 +35,7 @@ source_set("ardia") {
     "ac_omnibox.h",
     "ac_passwords.cc",
     "ac_passwords.h",
+    "ac_passwords_sync_policy.h",
     "ac_process.cc",
     "ac_process.h",
     "ac_reauth.cc",

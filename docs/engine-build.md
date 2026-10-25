@@ -267,11 +267,35 @@ framework.
   `ac_<domain>.{h,cc}` to its sources (sorted) and its deps.
   `chromium-ardia-layer.patch` links it into the macOS `//chrome:chrome_dll` (ArdiaCore's framework), through the
   `:exports` group that exports `_ac_*`.
-- **The C surface.** `public/ac_engine.h` is plain C with the rules: exports are `ac_<domain>_<verb>`, all with one
+- **The C surface.** `public/ac_engine.h` is plain C with the rules: ordinary service exports are `ac_<domain>_<verb>`, with one
   signature `void (const char* profile_dir, const char* args_json, ac_engine_reply_t reply, void* context)`; JSON
   object in, JSON object out (`{"error": …}` on failure); UI thread only; the reply runs once, maybe before the
   call returns. Events go to one sink (`ac_engine_set_event_sink`) as `("<domain>.<what>", {profile, …})`.
   `ac_engine.h` has the C++ side (`AC_ENGINE_CALL`, `ardia::Call`, `Reply`, `Emit`).
+- **Native password-sync exception.** `ac_passwords_sync_read` and `ac_passwords_sync_compare_and_set` use
+  their dedicated typedefs in `public/ac_engine.h`, never `ac_engine_call_t`. The read takes authorization,
+  login-row and completion callbacks; compare-and-set takes authorization and completion callbacks plus borrowed
+  JSON arguments. Only the typed native bridge may resolve them: generic `call:`, `callWithSecret:` and `exports:`
+  reject these symbols. A missing typed export means unavailable, not an empty store. These are unfinished draft
+  APIs, not evidence that password sync is ready to ship.
+  - Calls and callbacks run on Chromium's UI thread (the app's main thread). Completion may run before return.
+    Inputs are borrowed until the entrypoint returns. Keep callbacks and their context alive until the one
+    completion callback; no row or authorization callback may run after it. Null completion is invalid usage and
+    is ignored without store access by the disabled mutation endpoint.
+  - The authorization callback may run repeatedly, including before and after each row. Nonzero means the exact
+    operation is still authorized; zero revokes it. Read operations also check their deadline, profile lifetime
+    and shutdown state. An app-side timeout completes its consumer but retains the native callback holder until
+    Chromium's completion arrives, so a late callback cannot use freed context or complete the consumer twice.
+  - Login fields are borrowed UTF-8 byte spans valid only during the row callback, not NUL-terminated strings.
+    Copy them before return; embedded NULs are meaningful. `has_created` distinguishes unknown creation time
+    from Unix epoch zero; `created_ms` is milliseconds since Unix epoch when present. The bridge rejects invalid
+    UTF-8 or non-finite dates and buffers rows until successful completion. Failure or revocation releases all
+    buffered rows and returns unavailable (`nil`), never a partial or empty successful snapshot.
+  - Completion uses zero for failure/unavailable and nonzero for a complete authorized read. This draft's
+    compare-and-set always completes with zero before resolving a profile, parsing secrets, invoking authorization,
+    or accessing any password service, including for equal-value/no-op requests. It does not report committed or
+    conflict and does not implement database CAS. Incoming password updates remain paused until a real backend
+    transaction and explicit committed/conflict/error results are implemented and verified.
 - **The app** includes `public/ac_engine.h` from the repo and looks each export up with `dlsym` on the engine
   framework (`packages/ardiacore/ios/ArdiaCoreEngineBridge.mm`). A missing export aborts: the app bundles an engine it wasn't built
   for. Add each new call to `docs/ardiacore-parity.md`.

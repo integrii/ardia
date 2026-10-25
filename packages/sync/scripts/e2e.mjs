@@ -9,7 +9,7 @@ import { freePort, launch, reporter, sleep } from "../../../scripts/lib/instance
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const args = process.argv.slice(2);
-const MODE = args.find((arg) => arg.startsWith("--")) ?? "--full";
+const MODE = args.find((arg) => arg.startsWith("--")) ?? "--non-passwords";
 const positions = args.filter((arg) => !arg.startsWith("--"));
 if (!["--full", "--non-passwords", "--denial"].includes(MODE) || args.filter((arg) => arg.startsWith("--")).length > 1 || positions.length > 2)
   throw new Error("Usage: node packages/sync/scripts/e2e.mjs [app] [new-scratch-directory] [--full|--non-passwords|--denial]");
@@ -38,7 +38,10 @@ async function start(name) {
     ready: { timeout: 120_000, test: "return !!globalThis.acSync && Object.keys(ac.store.getState().windows).length > 0" },
   }));
   note(`${name}: pid ${app.pid}, DevTools ${app.port}, log ${app.log}`);
-  if (PASSWORDS && await ev(name, "return acSync.useSync.getState().enabled")) await authorizePasswords(name);
+  if (PASSWORDS && await ev(name, "return acSync.useSync.getState().enabled")) {
+    await until(`${name} sync startup`, () => ev(name, 'return acSync.useSync.getState().status !== "starting"'));
+    await authorizePasswords(name);
+  }
 }
 
 const short = (x, n) => (x === undefined ? "undefined" : JSON.stringify(x).slice(0, n));
