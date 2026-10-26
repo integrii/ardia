@@ -51,6 +51,7 @@ chromium chromium-password-generation-local.patch
 chromium chromium-password-sync-checked-transactions.patch
 chromium chromium-password-sync-checked-statements.patch
 chromium chromium-password-sync-transaction.patch
+chromium chromium-password-sync-serialization.patch
 chromium chromium-window-docked-devtools.patch
 chromium chromium-window-hosted.patch
 chromium chromium-extension-installed-bubble.patch

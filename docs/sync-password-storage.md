@@ -89,6 +89,15 @@ paths in 406 preceding patch entries or the manager patch. This is not a full-se
 build, C++ compilation, actual VFS behavior, native lifecycle verification or permission
 to enable incoming writes. All existing transaction-test bodies remain unchanged.
 
+## Serialized row prerequisite, not integrated
+
+[Strict serialization helpers](sync-password-serialization.md) provide checked
+Pickle and version-aware FormData preflight, including supported nonempty legacy
+records. Their separate patch follows this manager candidate and adds membership
+to its existing implementation/test targets. The manager does not yet consume
+them. All 18 new real serialization gtest definitions remain uncompiled and unrun;
+source review and patch application are not Chromium execution or write enablement.
+
 ## Intended transaction contract
 
 `PasswordStoreInterface::CompareAndSetLogin` dispatches to the backend sequence. Unsupported
